@@ -1,0 +1,755 @@
+#!/usr/bin/env bash
+#
+# rcc-sync — explicit, non-destructive local <-> OneDrive sync workflow
+# Built for Rogue Community College.
+#
+# rcc-sync never talks to the network itself. It assumes a separate
+# OneDrive client (e.g. abraunegg's onedrive) is already keeping
+# ~/OneDrive in sync with the cloud. This script only moves files between
+# a local workspace and a local OneDrive-backed directory, using rsync.
+#
+# Version: 0.1
+
+set -uo pipefail
+# NOTE: intentionally not using `set -e`. Several commands used here
+# (diff, rsync in some modes) have meaningful non-zero exit codes that
+# do not mean "script failure", so we check exit codes explicitly instead.
+
+VERSION="rcc-sync v0.1"
+
+CONFIG_DIR="${HOME}/.config/rcc-sync"
+CONFIG_FILE="${CONFIG_DIR}/config"
+
+# Defaults — overridden by config file if present.
+LOCAL_ROOT="${HOME}/College"
+REMOTE_ROOT="${HOME}/OneDrive/College"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Expand a leading ~ (or ~/...) to $HOME. We do this ourselves because
+# values come from a config file, not shell expansion.
+expand_path() {
+    local p="$1"
+    case "$p" in
+        "~") printf '%s' "${HOME}" ;;
+        "~/"*) printf '%s' "${HOME}/${p#\~/}" ;;
+        *) printf '%s' "$p" ;;
+    esac
+}
+
+# Parse KEY=VALUE lines from the config file manually (never sourced).
+# Ignores blank lines and lines starting with '#'. Only known keys are
+# honored; unknown keys are ignored so a bad/foreign config can't do
+# anything but be ignored.
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip leading/trailing whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        [[ -z "$line" ]] && continue
+        [[ "$line" == \#* ]] && continue
+        [[ "$line" != *"="* ]] && continue
+
+        key="${line%%=*}"
+        value="${line#*=}"
+
+        # Trim whitespace around key/value
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        # Strip surrounding quotes if present
+        if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+            value="${value:1:-1}"
+        fi
+
+        case "$key" in
+            LOCAL_ROOT)  LOCAL_ROOT="$(expand_path "$value")" ;;
+            REMOTE_ROOT) REMOTE_ROOT="$(expand_path "$value")" ;;
+            *) : ;; # unknown key, ignore
+        esac
+    done < "$CONFIG_FILE"
+}
+
+# Print a path with $HOME collapsed back to ~ for display purposes.
+display_path() {
+    local p="$1"
+    if [[ "$p" == "${HOME}"* ]]; then
+        printf '~%s' "${p#"${HOME}"}"
+    else
+        printf '%s' "$p"
+    fi
+}
+
+require_dir() {
+    local dir="$1"
+    local label="$2"
+    if [[ ! -d "$dir" ]]; then
+        echo "Error: $label directory does not exist: $dir" >&2
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Commands: help / version / config / init
+# ---------------------------------------------------------------------------
+
+cmd_help() {
+    cat <<'EOF'
+RCC Sync
+
+USAGE
+
+  rcc-sync COMMAND
+
+COMMANDS
+
+  help
+      Show this help screen
+
+  version
+      Show version information
+
+  status
+      Show local/remote differences
+
+  diff
+      Show detailed differences (raw diff -rq output)
+
+  push all
+      Push local changes to remote
+
+  pull all
+      Pull remote changes to local
+
+  dry-push all
+      Preview push (no files modified)
+
+  dry-pull all
+      Preview pull (no files modified)
+
+  push file <path>
+      Push a single file
+
+  pull file <path>
+      Pull a single file
+
+  push dir <path>
+      Push a single directory
+
+  pull dir <path>
+      Pull a single directory
+
+  init
+      Interactive setup, writes ~/.config/rcc-sync/config
+
+  config
+      Show current LOCAL_ROOT / REMOTE_ROOT
+
+  --tui, -t
+      Launch interactive menu-driven mode. Uses whiptail/dialog if
+      installed and a terminal is attached; otherwise falls back to a
+      plain numbered menu.
+
+NOTES
+
+  rcc-sync never deletes files and never runs in the background.
+  It assumes your OneDrive client is already syncing ~/OneDrive with
+  the cloud; rcc-sync only moves files locally.
+EOF
+}
+
+cmd_version() {
+    echo "$VERSION"
+}
+
+cmd_config() {
+    printf 'LOCAL_ROOT  = %s\n' "$(display_path "$LOCAL_ROOT")"
+    printf 'REMOTE_ROOT = %s\n' "$(display_path "$REMOTE_ROOT")"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        printf '\n(loaded from %s)\n' "$CONFIG_FILE"
+    else
+        printf '\n(no config file found, using defaults — run "rcc-sync init" to set one up)\n'
+    fi
+}
+
+write_config() {
+    mkdir -p "$CONFIG_DIR"
+    {
+        echo "# rcc-sync config"
+        echo "LOCAL_ROOT=$(display_path "$LOCAL_ROOT")"
+        echo "REMOTE_ROOT=$(display_path "$REMOTE_ROOT")"
+    } > "$CONFIG_FILE"
+}
+
+cmd_init() {
+    echo "RCC Sync setup"
+    echo
+
+    local input_local input_remote
+    read -r -p "Local College directory [$(display_path "$LOCAL_ROOT")]: " input_local
+    read -r -p "OneDrive directory [$(display_path "$REMOTE_ROOT")]: " input_remote
+
+    [[ -n "$input_local" ]] && LOCAL_ROOT="$(expand_path "$input_local")"
+    [[ -n "$input_remote" ]] && REMOTE_ROOT="$(expand_path "$input_remote")"
+
+    write_config
+
+    echo
+    echo "Saved to $CONFIG_FILE"
+    cmd_config
+}
+
+# ---------------------------------------------------------------------------
+# Commands: status / diff
+# ---------------------------------------------------------------------------
+
+# Shared: run diff -rq between LOCAL_ROOT and REMOTE_ROOT.
+# diff exits 0 (identical), 1 (differences found), or 2 (trouble) — none
+# of those should be treated as a script failure.
+run_diff_rq() {
+    diff -rq "$LOCAL_ROOT" "$REMOTE_ROOT" 2>/dev/null
+}
+
+cmd_diff() {
+    require_dir "$LOCAL_ROOT" "local" || return 1
+    require_dir "$REMOTE_ROOT" "remote" || return 1
+
+    local out
+    out="$(run_diff_rq)"
+    if [[ -z "$out" ]]; then
+        echo "No differences."
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+cmd_status() {
+    require_dir "$LOCAL_ROOT" "local" || return 1
+    require_dir "$REMOTE_ROOT" "remote" || return 1
+
+    local local_only=() remote_only=() different=()
+    local line
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" == "Only in "* ]]; then
+            # Format: "Only in <dir>: <name>"
+            local rest dir name rel full
+            rest="${line#Only in }"
+            dir="${rest%%: *}"
+            name="${rest#*: }"
+
+            if [[ "$dir" == "$LOCAL_ROOT"* ]]; then
+                rel="${dir#"$LOCAL_ROOT"}"
+                rel="${rel#/}"
+                [[ -n "$rel" ]] && name="${rel}/${name}"
+                full="${LOCAL_ROOT}/${name}"
+                if [[ -d "$full" ]]; then
+                    while IFS= read -r f; do
+                        local_only+=("${name}/${f#"${full}"/}")
+                    done < <(find "$full" -type f)
+                else
+                    local_only+=("$name")
+                fi
+            elif [[ "$dir" == "$REMOTE_ROOT"* ]]; then
+                rel="${dir#"$REMOTE_ROOT"}"
+                rel="${rel#/}"
+                [[ -n "$rel" ]] && name="${rel}/${name}"
+                full="${REMOTE_ROOT}/${name}"
+                if [[ -d "$full" ]]; then
+                    while IFS= read -r f; do
+                        remote_only+=("${name}/${f#"${full}"/}")
+                    done < <(find "$full" -type f)
+                else
+                    remote_only+=("$name")
+                fi
+            fi
+
+        elif [[ "$line" == "Files "* ]]; then
+            # Format: "Files <a> and <b> differ"
+            local rest a
+            rest="${line#Files }"
+            a="${rest%% and *}"
+            if [[ "$a" == "$LOCAL_ROOT"* ]]; then
+                local rel="${a#"$LOCAL_ROOT"}"
+                rel="${rel#/}"
+                different+=("$rel")
+            fi
+        fi
+    done < <(run_diff_rq)
+
+    if [[ ${#local_only[@]} -eq 0 && ${#remote_only[@]} -eq 0 && ${#different[@]} -eq 0 ]]; then
+        echo "Up to date. No differences between local and remote."
+        return 0
+    fi
+
+    if [[ ${#local_only[@]} -gt 0 ]]; then
+        echo "LOCAL ONLY"
+        echo
+        for f in "${local_only[@]}"; do printf '  %s\n' "$f"; done
+        echo
+    fi
+
+    if [[ ${#remote_only[@]} -gt 0 ]]; then
+        echo "REMOTE ONLY"
+        echo
+        for f in "${remote_only[@]}"; do printf '  %s\n' "$f"; done
+        echo
+    fi
+
+    if [[ ${#different[@]} -gt 0 ]]; then
+        echo "DIFFERENT"
+        echo
+        for f in "${different[@]}"; do printf '  %s\n' "$f"; done
+        echo
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands: push/pull all (V1), dry-push/dry-pull all (V1)
+# ---------------------------------------------------------------------------
+
+cmd_dry_push_all() {
+    require_dir "$LOCAL_ROOT" "local" || return 1
+    mkdir -p "$REMOTE_ROOT"
+    echo "Preview: push ($(display_path "$LOCAL_ROOT") -> $(display_path "$REMOTE_ROOT"))"
+    rsync -avn "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+}
+
+cmd_push_all() {
+    require_dir "$LOCAL_ROOT" "local" || return 1
+    mkdir -p "$REMOTE_ROOT"
+    echo "Push: $(display_path "$LOCAL_ROOT") -> $(display_path "$REMOTE_ROOT")"
+    rsync -av "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+}
+
+cmd_dry_pull_all() {
+    require_dir "$REMOTE_ROOT" "remote" || return 1
+    mkdir -p "$LOCAL_ROOT"
+    echo "Preview: pull ($(display_path "$REMOTE_ROOT") -> $(display_path "$LOCAL_ROOT"))"
+    rsync -avn "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+}
+
+cmd_pull_all() {
+    require_dir "$REMOTE_ROOT" "remote" || return 1
+    mkdir -p "$LOCAL_ROOT"
+    echo "Pull: $(display_path "$REMOTE_ROOT") -> $(display_path "$LOCAL_ROOT")"
+    rsync -av "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+}
+
+# ---------------------------------------------------------------------------
+# Commands: push/pull file/dir (V2)
+# ---------------------------------------------------------------------------
+
+cmd_push_file() {
+    local rel="$1"
+    local src="${LOCAL_ROOT}/${rel}"
+    local dest="${REMOTE_ROOT}/${rel}"
+
+    if [[ ! -f "$src" ]]; then
+        echo "Error: local file not found: $(display_path "$src")" >&2
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$dest")"
+    echo "Push file: ${rel}"
+    rsync -av "$src" "$dest"
+}
+
+cmd_pull_file() {
+    local rel="$1"
+    local src="${REMOTE_ROOT}/${rel}"
+    local dest="${LOCAL_ROOT}/${rel}"
+
+    if [[ ! -f "$src" ]]; then
+        echo "Error: remote file not found: $(display_path "$src")" >&2
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$dest")"
+    echo "Pull file: ${rel}"
+    rsync -av "$src" "$dest"
+}
+
+cmd_push_dir() {
+    local rel="$1"
+    local src="${LOCAL_ROOT}/${rel}"
+    local dest="${REMOTE_ROOT}/${rel}"
+
+    if [[ ! -d "$src" ]]; then
+        echo "Error: local directory not found: $(display_path "$src")" >&2
+        return 1
+    fi
+
+    mkdir -p "$dest"
+    echo "Push dir: ${rel}"
+    rsync -av "${src}/" "${dest}/"
+}
+
+cmd_pull_dir() {
+    local rel="$1"
+    local src="${REMOTE_ROOT}/${rel}"
+    local dest="${LOCAL_ROOT}/${rel}"
+
+    if [[ ! -d "$src" ]]; then
+        echo "Error: remote directory not found: $(display_path "$src")" >&2
+        return 1
+    fi
+
+    mkdir -p "$dest"
+    echo "Pull dir: ${rel}"
+    rsync -av "${src}/" "${dest}/"
+}
+
+# ---------------------------------------------------------------------------
+# TUI (interactive mode) — rcc-sync --tui / -t
+# ---------------------------------------------------------------------------
+
+DIALOG_BIN=""
+
+# Decide whether we can use whiptail/dialog: the binary must exist AND we
+# need a real terminal on both stdin and stdout (ncurses needs a tty).
+# If either condition fails, we transparently fall back to the plain
+# numbered-menu TUI instead of crashing.
+detect_tui_backend() {
+    if [[ -t 0 && -t 1 ]]; then
+        if command -v whiptail >/dev/null 2>&1; then
+            DIALOG_BIN="whiptail"
+        elif command -v dialog >/dev/null 2>&1; then
+            DIALOG_BIN="dialog"
+        fi
+    fi
+}
+
+# --- dialog/whiptail widget wrappers ---------------------------------------
+
+dlg_menu() {
+    # $1 = title, $2 = prompt, rest = tag/description pairs
+    local title="$1" prompt="$2"
+    shift 2
+    "$DIALOG_BIN" --title "$title" --menu "$prompt" 20 72 12 "$@" 3>&1 1>&2 2>&3
+}
+
+dlg_input() {
+    # $1 = title, $2 = prompt, $3 = default
+    "$DIALOG_BIN" --title "$1" --inputbox "$2" 10 72 "$3" 3>&1 1>&2 2>&3
+}
+
+dlg_show_file() {
+    # $1 = title, $2 = file to display (scrollable)
+    "$DIALOG_BIN" --title "$1" --textbox "$2" 24 78
+}
+
+# Run a command function (with optional args), capture its stdout+stderr,
+# and show the result in a scrollable dialog box.
+dlg_run_capture() {
+    local title="$1"
+    shift
+    local tmp
+    tmp="$(mktemp)"
+    "$@" > "$tmp" 2>&1
+    [[ -s "$tmp" ]] || echo "(no output)" > "$tmp"
+    dlg_show_file "$title" "$tmp"
+    rm -f "$tmp"
+}
+
+dlg_push_menu() {
+    local choice rc
+    choice="$(dlg_menu "Push" "Push local -> remote:" \
+        all  "Push everything" \
+        file "Push a single file" \
+        dir  "Push a single directory" \
+        back "Back to main menu")"
+    rc=$?
+    [[ $rc -ne 0 || "$choice" == "back" ]] && return
+
+    case "$choice" in
+        all)
+            dlg_run_capture "Push All" cmd_push_all
+            ;;
+        file)
+            local path
+            path="$(dlg_input "Push File" "Relative path under $(display_path "$LOCAL_ROOT"):" "")"
+            [[ $? -eq 0 && -n "$path" ]] && dlg_run_capture "Push File: $path" cmd_push_file "$path"
+            ;;
+        dir)
+            local path
+            path="$(dlg_input "Push Directory" "Relative path under $(display_path "$LOCAL_ROOT"):" "")"
+            [[ $? -eq 0 && -n "$path" ]] && dlg_run_capture "Push Dir: $path" cmd_push_dir "$path"
+            ;;
+    esac
+}
+
+dlg_pull_menu() {
+    local choice rc
+    choice="$(dlg_menu "Pull" "Pull remote -> local:" \
+        all  "Pull everything" \
+        file "Pull a single file" \
+        dir  "Pull a single directory" \
+        back "Back to main menu")"
+    rc=$?
+    [[ $rc -ne 0 || "$choice" == "back" ]] && return
+
+    case "$choice" in
+        all)
+            dlg_run_capture "Pull All" cmd_pull_all
+            ;;
+        file)
+            local path
+            path="$(dlg_input "Pull File" "Relative path under $(display_path "$REMOTE_ROOT"):" "")"
+            [[ $? -eq 0 && -n "$path" ]] && dlg_run_capture "Pull File: $path" cmd_pull_file "$path"
+            ;;
+        dir)
+            local path
+            path="$(dlg_input "Pull Directory" "Relative path under $(display_path "$REMOTE_ROOT"):" "")"
+            [[ $? -eq 0 && -n "$path" ]] && dlg_run_capture "Pull Dir: $path" cmd_pull_dir "$path"
+            ;;
+    esac
+}
+
+dlg_init_menu() {
+    local new_local new_remote rc
+    new_local="$(dlg_input "Setup — Local" "Local College directory:" "$(display_path "$LOCAL_ROOT")")"
+    rc=$?
+    [[ $rc -ne 0 ]] && return
+    new_remote="$(dlg_input "Setup — Remote" "OneDrive directory:" "$(display_path "$REMOTE_ROOT")")"
+    rc=$?
+    [[ $rc -ne 0 ]] && return
+
+    [[ -n "$new_local" ]] && LOCAL_ROOT="$(expand_path "$new_local")"
+    [[ -n "$new_remote" ]] && REMOTE_ROOT="$(expand_path "$new_remote")"
+    write_config
+    dlg_run_capture "Config Saved" cmd_config
+}
+
+run_tui_dialog() {
+    local choice rc
+    while true; do
+        choice="$(dlg_menu "RCC Sync ${VERSION#rcc-sync }" "Choose an action:" \
+            status   "Show status" \
+            diffcmd  "Show detailed diff" \
+            push     "Push (local -> remote)" \
+            pull     "Pull (remote -> local)" \
+            drypush  "Preview push (dry-run)" \
+            drypull  "Preview pull (dry-run)" \
+            config   "Show current config" \
+            init     "Setup / change config" \
+            quit     "Quit")"
+        rc=$?
+        [[ $rc -ne 0 ]] && break   # ESC / Cancel
+
+        case "$choice" in
+            status)  dlg_run_capture "Status" cmd_status ;;
+            diffcmd) dlg_run_capture "Diff" cmd_diff ;;
+            push)    dlg_push_menu ;;
+            pull)    dlg_pull_menu ;;
+            drypush) dlg_run_capture "Dry Push Preview" cmd_dry_push_all ;;
+            drypull) dlg_run_capture "Dry Pull Preview" cmd_dry_pull_all ;;
+            config)  dlg_run_capture "Config" cmd_config ;;
+            init)    dlg_init_menu ;;
+            quit)    break ;;
+        esac
+    done
+    clear 2>/dev/null || true
+}
+
+# --- plain fallback TUI (no whiptail/dialog, or no tty) --------------------
+
+plain_pause() {
+    echo
+    read -r -p "Press Enter to continue..." _ || true
+}
+
+plain_push_menu() {
+    echo
+    echo "  1) Push all"
+    echo "  2) Push file"
+    echo "  3) Push dir"
+    echo "  4) Back"
+    local c
+    read -r -p "Choose an option [1-4]: " c
+    case "$c" in
+        1) cmd_push_all; plain_pause ;;
+        2)
+            local p
+            read -r -p "Relative path to file (under $(display_path "$LOCAL_ROOT")): " p
+            [[ -n "$p" ]] && cmd_push_file "$p"
+            plain_pause
+            ;;
+        3)
+            local p
+            read -r -p "Relative path to dir (under $(display_path "$LOCAL_ROOT")): " p
+            [[ -n "$p" ]] && cmd_push_dir "$p"
+            plain_pause
+            ;;
+        *) : ;;
+    esac
+}
+
+plain_pull_menu() {
+    echo
+    echo "  1) Pull all"
+    echo "  2) Pull file"
+    echo "  3) Pull dir"
+    echo "  4) Back"
+    local c
+    read -r -p "Choose an option [1-4]: " c
+    case "$c" in
+        1) cmd_pull_all; plain_pause ;;
+        2)
+            local p
+            read -r -p "Relative path to file (under $(display_path "$REMOTE_ROOT")): " p
+            [[ -n "$p" ]] && cmd_pull_file "$p"
+            plain_pause
+            ;;
+        3)
+            local p
+            read -r -p "Relative path to dir (under $(display_path "$REMOTE_ROOT")): " p
+            [[ -n "$p" ]] && cmd_pull_dir "$p"
+            plain_pause
+            ;;
+        *) : ;;
+    esac
+}
+
+run_tui_plain() {
+    local choice
+    while true; do
+        echo
+        echo "RCC Sync — Interactive Mode (${VERSION#rcc-sync })"
+        echo
+        echo "  1) Status"
+        echo "  2) Diff"
+        echo "  3) Push"
+        echo "  4) Pull"
+        echo "  5) Dry Push (preview)"
+        echo "  6) Dry Pull (preview)"
+        echo "  7) Config"
+        echo "  8) Init / Setup"
+        echo "  9) Quit"
+        echo
+
+        if ! read -r -p "Choose an option [1-9]: " choice; then
+            break   # stdin closed (EOF) — exit cleanly
+        fi
+
+        case "$choice" in
+            1) cmd_status; plain_pause ;;
+            2) cmd_diff; plain_pause ;;
+            3) plain_push_menu ;;
+            4) plain_pull_menu ;;
+            5) cmd_dry_push_all; plain_pause ;;
+            6) cmd_dry_pull_all; plain_pause ;;
+            7) cmd_config; plain_pause ;;
+            8) cmd_init; plain_pause ;;
+            9) break ;;
+            "") : ;;
+            *) echo "Invalid option: $choice"; plain_pause ;;
+        esac
+    done
+}
+
+run_tui() {
+    detect_tui_backend
+    if [[ -n "$DIALOG_BIN" ]]; then
+        run_tui_dialog
+    else
+        run_tui_plain
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Dependency check
+# ---------------------------------------------------------------------------
+
+check_deps() {
+    local missing=()
+    command -v rsync >/dev/null 2>&1 || missing+=("rsync")
+    command -v diff  >/dev/null 2>&1 || missing+=("diffutils (diff)")
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: missing required tool(s): ${missing[*]}" >&2
+        echo "Install them with your distro's package manager and try again." >&2
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+    check_deps
+    load_config
+
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        help|-h|--help)
+            cmd_help
+            ;;
+        version|-v|--version)
+            cmd_version
+            ;;
+        --tui|-t)
+            run_tui
+            ;;
+        status)
+            cmd_status
+            ;;
+        diff)
+            cmd_diff
+            ;;
+        config)
+            cmd_config
+            ;;
+        init)
+            cmd_init
+            ;;
+        push)
+            case "${1:-}" in
+                all)  cmd_push_all ;;
+                file) [[ -n "${2:-}" ]] || { echo "Usage: rcc-sync push file <path>" >&2; exit 1; }; cmd_push_file "$2" ;;
+                dir)  [[ -n "${2:-}" ]] || { echo "Usage: rcc-sync push dir <path>" >&2; exit 1; }; cmd_push_dir "$2" ;;
+                *) echo "Usage: rcc-sync push {all|file <path>|dir <path>}" >&2; exit 1 ;;
+            esac
+            ;;
+        pull)
+            case "${1:-}" in
+                all)  cmd_pull_all ;;
+                file) [[ -n "${2:-}" ]] || { echo "Usage: rcc-sync pull file <path>" >&2; exit 1; }; cmd_pull_file "$2" ;;
+                dir)  [[ -n "${2:-}" ]] || { echo "Usage: rcc-sync pull dir <path>" >&2; exit 1; }; cmd_pull_dir "$2" ;;
+                *) echo "Usage: rcc-sync pull {all|file <path>|dir <path>}" >&2; exit 1 ;;
+            esac
+            ;;
+        dry-push)
+            case "${1:-}" in
+                all) cmd_dry_push_all ;;
+                *) echo "Usage: rcc-sync dry-push all" >&2; exit 1 ;;
+            esac
+            ;;
+        dry-pull)
+            case "${1:-}" in
+                all) cmd_dry_pull_all ;;
+                *) echo "Usage: rcc-sync dry-pull all" >&2; exit 1 ;;
+            esac
+            ;;
+        *)
+            echo "Unknown command: $cmd" >&2
+            echo "Run 'rcc-sync help' for usage." >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
