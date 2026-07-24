@@ -124,6 +124,8 @@ rcc-sync status
 
 Example output:
 
+![Status Output](Images/Status.png)
+
 ```text
 LOCAL ONLY
 
@@ -200,6 +202,22 @@ rcc-sync dry-push all
 rcc-sync dry-pull all
 ```
 
+![Dry Push Preview](Images/DryPush.png)
+
+---
+
+### Verbose and Quiet Modes
+
+Control output verbosity:
+
+```bash
+rcc-sync push all --quiet
+rcc-sync pull dir CIS120 --verbose
+```
+
+- `--quiet` (`-q`): Suppresses standard output
+- `--verbose`: Increases verbosity
+
 ---
 
 ### Mirror Operations
@@ -273,29 +291,28 @@ rcc-sync -t
 If `whiptail` or `dialog` is installed, RCC Sync automatically uses a full-screen TUI with:
 
 - A **Loading...** progress gauge displayed while any operation runs (no raw terminal flicker)
-- A **file checklist picker** for push/pull file operations (no manual path typing)
+- A **file checklist picker** and **directory browser** for push/pull operations (no manual path typing)
+- A **Search** functionality to quickly filter and sync files by name or extension
+- **Customizable Color Themes** (Standard, Dark Mode, Deep Ocean, and Matrix)
+- A **Live Status view** that auto-refreshes your sync status
+- A **Keyboard shortcuts** help screen
 - An explicit **⚠ WARNING** confirmation screen (defaulting to **No**) before any mirror operation
 
-```text
-┌──────────────── RCC Sync v0.1 ─────────────────┐
-│ Choose an action:                               │
-│                                                 │
-│   Status                                        │
-│   Diff                                          │
-│   Push                                          │
-│   Pull                                          │
-│   ⚠  Mirror — destructive exact sync           │
-│   Dry Push                                      │
-│   Dry Pull                                      │
-│   Config                                        │
-│   Setup / change config                         │
-│   Quit                                          │
-└─────────────────────────────────────────────────┘
-```
+![Main TUI Menu](Images/TUI.png)
+![File Selection](Images/FileSelect.png)
+![Loading Indicator](Images/Loading.png)
 
 If neither `whiptail` nor `dialog` is installed, RCC Sync automatically falls back to a plain-text numbered menu with the same functionality, including a `YES`-typed confirmation requirement for mirror operations.
 
 No additional configuration is required.
+
+---
+
+### Shell Completions
+
+Native shell completions are provided for **Bash**, **Zsh**, **Fish**, and **Nushell**.
+
+When installed via the provided AUR package or Nix flake, these are automatically placed into the correct system directories so you get smart tab-completion for all `rcc-sync` commands, flags, and file paths.
 
 ---
 
@@ -603,7 +620,7 @@ rcc-sync version
 Expected output:
 
 ```text
-rcc-sync v1.0.0
+rcc-sync v1.1.0
 ```
 
 ---
@@ -721,7 +738,7 @@ Synchronize intentionally.
 ## Current Version
 
 ```text
-rcc-sync v1.0.0
+rcc-sync v1.1.0
 ```
 
 ---

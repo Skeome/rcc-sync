@@ -1,0 +1,51 @@
+#compdef rcc-sync
+
+_rcc-sync() {
+    local -a commands
+
+    commands=(
+        'help:Show help screen'
+        'version:Show version information'
+        'status:Show local/remote differences'
+        'diff:Show detailed differences'
+        'push:Push local changes to remote'
+        'pull:Pull remote changes to local'
+        'dry-push:Preview push'
+        'dry-pull:Preview pull'
+        'mirror:DESTRUCTIVE exact sync'
+        'dry-mirror:Preview mirror'
+        'init:Interactive setup'
+        'config:Show current configuration'
+        '--tui:Launch interactive menu-driven mode'
+        '-t:Launch interactive menu-driven mode'
+        '--quiet:Quiet mode'
+        '-q:Quiet mode'
+        '--verbose:Verbose mode'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'rcc-sync commands' commands
+    elif (( CURRENT == 3 )); then
+        case "$words[2]" in
+            push|pull)
+                _values 'subcommands' 'all[All files]' 'file[Specific files]' 'dir[Specific directory]'
+                ;;
+            dry-push|dry-pull)
+                _values 'subcommands' 'all[All files]'
+                ;;
+            mirror|dry-mirror)
+                _values 'subcommands' 'local[Local to Remote]' 'remote[Remote to Local]'
+                ;;
+        esac
+    else
+        case "$words[2]" in
+            push|pull)
+                case "$words[3]" in
+                    file|dir) _files ;;
+                esac
+                ;;
+        esac
+    fi
+}
+
+_rcc-sync "$@"

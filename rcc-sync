@@ -15,7 +15,27 @@ set -uo pipefail
 # (diff, rsync in some modes) have meaningful non-zero exit codes that
 # do not mean "script failure", so we check exit codes explicitly instead.
 
-VERSION="rcc-sync v1.0.0"
+VERSION="rcc-sync v1.1.0"
+
+VERBOSE=0
+QUIET=0
+
+# ANSI Colors
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_RED='\033[0;31m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_BLUE='\033[0;34m'
+C_CYAN='\033[0;36m'
+
+log_error() {
+    echo -e "${C_RED}${C_BOLD}Error:${C_RESET} $*" >&2
+}
+
+log_warn() {
+    echo -e "${C_YELLOW}${C_BOLD}WARNING:${C_RESET} $*" >&2
+}
 
 CONFIG_DIR="${HOME}/.config/rcc-sync"
 CONFIG_FILE="${CONFIG_DIR}/config"
@@ -27,6 +47,9 @@ REMOTE_ROOT="${HOME}/OneDrive/College"
 # default so they are never uploaded. Set to ~/OneDrive/RCC-Sync_Archives
 # in config if you want cloud copies of your snapshots.
 ARCHIVE_DIR="${HOME}/.rcc-sync-archives"
+
+# TUI color theme
+TUI_THEME="default"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -77,6 +100,7 @@ load_config() {
             LOCAL_ROOT)   LOCAL_ROOT="$(expand_path "$value")" ;;
             REMOTE_ROOT)  REMOTE_ROOT="$(expand_path "$value")" ;;
             ARCHIVE_DIR)  ARCHIVE_DIR="$(expand_path "$value")" ;;
+            TUI_THEME)    TUI_THEME="$value" ;;
             *) : ;; # unknown key, ignore
         esac
     done < "$CONFIG_FILE"
@@ -96,7 +120,7 @@ require_dir() {
     local dir="$1"
     local label="$2"
     if [[ ! -d "$dir" ]]; then
-        echo "Error: $label directory does not exist: $dir" >&2
+        log_error "$label directory does not exist: $dir"
         return 1
     fi
     return 0
@@ -214,6 +238,7 @@ write_config() {
         echo "LOCAL_ROOT=$(display_path "$LOCAL_ROOT")"
         echo "REMOTE_ROOT=$(display_path "$REMOTE_ROOT")"
         echo "ARCHIVE_DIR=$(display_path "$ARCHIVE_DIR")"
+        echo "TUI_THEME=$TUI_THEME"
     } > "$CONFIG_FILE"
 }
 
@@ -323,21 +348,21 @@ cmd_status() {
     fi
 
     if [[ ${#local_only[@]} -gt 0 ]]; then
-        echo "LOCAL ONLY"
+        echo -e "${C_GREEN}${C_BOLD}LOCAL ONLY${C_RESET}: ${#local_only[@]} files"
         echo
         for f in "${local_only[@]}"; do printf '  %s\n' "$f"; done
         echo
     fi
 
     if [[ ${#remote_only[@]} -gt 0 ]]; then
-        echo "REMOTE ONLY"
+        echo -e "${C_BLUE}${C_BOLD}REMOTE ONLY${C_RESET}: ${#remote_only[@]} files"
         echo
         for f in "${remote_only[@]}"; do printf '  %s\n' "$f"; done
         echo
     fi
 
     if [[ ${#different[@]} -gt 0 ]]; then
-        echo "DIFFERENT"
+        echo -e "${C_YELLOW}${C_BOLD}DIFFERENT${C_RESET}: ${#different[@]} files"
         echo
         for f in "${different[@]}"; do printf '  %s\n' "$f"; done
         echo
@@ -358,8 +383,12 @@ cmd_dry_push_all() {
 cmd_push_all() {
     require_dir "$LOCAL_ROOT" "local" || return 1
     mkdir -p "$REMOTE_ROOT"
+    local rsync_args="-av"
+    [[ $QUIET -eq 1 ]] && rsync_args="-aq"
+    [[ $VERBOSE -eq 1 ]] && rsync_args="-avv"
+    
     echo "Push: $(display_path "$LOCAL_ROOT") -> $(display_path "$REMOTE_ROOT")"
-    rsync -av "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+    rsync $rsync_args "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
 }
 
 cmd_dry_pull_all() {
@@ -372,8 +401,12 @@ cmd_dry_pull_all() {
 cmd_pull_all() {
     require_dir "$REMOTE_ROOT" "remote" || return 1
     mkdir -p "$LOCAL_ROOT"
+    local rsync_args="-av"
+    [[ $QUIET -eq 1 ]] && rsync_args="-aq"
+    [[ $VERBOSE -eq 1 ]] && rsync_args="-avv"
+
     echo "Pull: $(display_path "$REMOTE_ROOT") -> $(display_path "$LOCAL_ROOT")"
-    rsync -av "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+    rsync $rsync_args "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
 }
 
 # ---------------------------------------------------------------------------
@@ -387,7 +420,7 @@ cmd_push_file() {
         local src="${LOCAL_ROOT}/${rel}"
         local dest="${REMOTE_ROOT}/${rel}"
         if [[ ! -f "$src" ]]; then
-            echo "Error: local file not found: $(display_path "$src")" >&2
+            log_error "local file not found: $(display_path "$src")"
             (( errors++ )) || true
             continue
         fi
@@ -405,7 +438,7 @@ cmd_pull_file() {
         local src="${REMOTE_ROOT}/${rel}"
         local dest="${LOCAL_ROOT}/${rel}"
         if [[ ! -f "$src" ]]; then
-            echo "Error: remote file not found: $(display_path "$src")" >&2
+            log_error "remote file not found: $(display_path "$src")"
             (( errors++ )) || true
             continue
         fi
@@ -422,7 +455,7 @@ cmd_push_dir() {
     local dest="${REMOTE_ROOT}/${rel}"
 
     if [[ ! -d "$src" ]]; then
-        echo "Error: local directory not found: $(display_path "$src")" >&2
+        log_error "local directory not found: $(display_path "$src")"
         return 1
     fi
 
@@ -437,7 +470,7 @@ cmd_pull_dir() {
     local dest="${LOCAL_ROOT}/${rel}"
 
     if [[ ! -d "$src" ]]; then
-        echo "Error: remote directory not found: $(display_path "$src")" >&2
+        log_error "remote directory not found: $(display_path "$src")"
         return 1
     fi
 
@@ -596,6 +629,33 @@ dlg_file_checklist() {
     done
 }
 
+dlg_dir_radiolist() {
+    local root="$1" title="$2" prompt="$3"
+    local items=() d rel
+    while IFS= read -r d; do
+        rel="${d#"${root}/"}"
+        items+=("$rel" "" OFF)
+    done < <(find "$root" -mindepth 1 -type d | sort)
+
+    if [[ ${#items[@]} -eq 0 ]]; then
+        "$DIALOG_BIN" --title "$title" --msgbox \
+            "No subdirectories found in $(display_path "$root")." 8 55
+        return 1
+    fi
+
+    local raw rc
+    raw="$("$DIALOG_BIN" --title "$title" --radiolist \
+        "$prompt" 30 80 20 "${items[@]}" 3>&1 1>&2 2>&3)"
+    rc=$?
+    [[ $rc -ne 0 ]] && return 1
+    [[ -z "$raw" ]] && return 1
+
+    # Remove quotes
+    raw="${raw%\"}"
+    raw="${raw#\"}"
+    printf '%s\n' "$raw"
+}
+
 dlg_push_menu() {
     local choice rc
     choice="$(dlg_menu "Push" "Push local -> remote:" \
@@ -622,7 +682,7 @@ dlg_push_menu() {
             ;;
         dir)
             local path
-            path="$(dlg_input "Push Directory" "Relative path under $(display_path "$LOCAL_ROOT"):" "")"
+            path="$(dlg_dir_radiolist "$LOCAL_ROOT" "Push Directory" "Select a directory to push:")"
             [[ $? -eq 0 && -n "$path" ]] && dlg_run_capture "Push Dir: $path" cmd_push_dir "$path"
             ;;
     esac
@@ -654,7 +714,7 @@ dlg_pull_menu() {
             ;;
         dir)
             local path
-            path="$(dlg_input "Pull Directory" "Relative path under $(display_path "$REMOTE_ROOT"):" "")"
+            path="$(dlg_dir_radiolist "$REMOTE_ROOT" "Pull Directory" "Select a directory to pull:")"
             [[ $? -eq 0 && -n "$path" ]] && dlg_run_capture "Pull Dir: $path" cmd_pull_dir "$path"
             ;;
     esac
@@ -679,6 +739,99 @@ dlg_init_menu() {
     [[ -n "$new_archive" ]] && ARCHIVE_DIR="$(expand_path "$new_archive")"
     write_config
     dlg_run_capture "Config Saved" cmd_config
+}
+
+dlg_theme_menu() {
+    local choice
+    choice="$(dlg_menu "Color Themes" "Select a TUI Theme:" \
+        default "Standard (Blue/Gray)" \
+        dark    "Dark Mode (Black/White)" \
+        ocean   "Deep Ocean (Blue/Cyan)" \
+        matrix  "The Matrix (Black/Green)" \
+        back    "Back to main menu")"
+    [[ $? -ne 0 || "$choice" == "back" ]] && return
+
+    TUI_THEME="$choice"
+    write_config
+    apply_theme
+}
+
+dlg_search_menu() {
+    local direction
+    direction="$(dlg_menu "Search" "Search where?" \
+        local "Local Workspace (to Push)" \
+        remote "OneDrive (to Pull)" \
+        back "Back")"
+    [[ $? -ne 0 || "$direction" == "back" ]] && return
+    
+    local query root cmd_fn action_title
+    if [[ "$direction" == "local" ]]; then
+        root="$LOCAL_ROOT"
+        cmd_fn="cmd_push_file"
+        action_title="Push"
+    else
+        root="$REMOTE_ROOT"
+        cmd_fn="cmd_pull_file"
+        action_title="Pull"
+    fi
+
+    query="$(dlg_input "Search" "Enter search term for $action_title:" "")"
+    [[ $? -ne 0 || -z "$query" ]] && return
+
+    local items=() f rel
+    while IFS= read -r f; do
+        rel="${f#"${root}/"}"
+        items+=("$rel" "" OFF)
+    done < <(find "$root" -type f -iname "*${query}*" | sort)
+
+    if [[ ${#items[@]} -eq 0 ]]; then
+        "$DIALOG_BIN" --title "Search Results" --msgbox "No files found matching '${query}'." 8 55
+        return
+    fi
+
+    local raw rc
+    raw="$("$DIALOG_BIN" --title "Search Results" --checklist "Select files to ${action_title} (matching '${query}'):" 30 80 20 "${items[@]}" 3>&1 1>&2 2>&3)"
+    rc=$?
+    [[ $rc -ne 0 || -z "$raw" ]] && return
+
+    local sel=() tok paths=()
+    eval "sel=($raw)"
+    for tok in "${sel[@]}"; do
+        paths+=("$tok")
+    done
+
+    [[ ${#paths[@]} -gt 0 ]] && dlg_run_capture "$action_title Files" "$cmd_fn" "${paths[@]}"
+}
+
+dlg_live_status() {
+    # Drop out of TUI temporarily to use watch
+    clear
+    echo "Entering Live Status mode. Press Ctrl+C to exit and return to the TUI."
+    sleep 1
+    # Use $0 to invoke the current script again
+    watch --color -n 2 "$0 status" || true
+}
+
+dlg_shortcuts() {
+    local text="RCC Sync TUI Keyboard Shortcuts
+
+Navigation:
+  [UP / DOWN Arrows]  Move between menu options
+  [TAB]               Switch between buttons (e.g., Ok / Cancel)
+  [PageUp / PageDown] Scroll through long file lists or output
+  
+Selection:
+  [ENTER]             Confirm selection / Press active button
+  [SPACE]             Toggle selection in file/directory checklists
+  
+Shortcuts / General:
+  [ESC]               Cancel / Go back to previous menu
+  [ESC] [ESC]         Double-tap ESC if single ESC does not register
+
+When in 'Live Status' mode:
+  [Ctrl + C]          Exit live status and return to main menu"
+    
+    "$DIALOG_BIN" --title "Keyboard Shortcuts" --msgbox "$text" 20 65
 }
 
 # Mirror sub-menu: warn, confirm, snapshot, then execute.
@@ -741,28 +894,36 @@ run_tui_dialog() {
     while true; do
         choice="$(dlg_menu "RCC Sync ${VERSION#rcc-sync }" "Choose an action:" \
             status   "Show status" \
+            livestat "Live auto-refreshing status" \
             diffcmd  "Show detailed diff" \
+            search   "Search & Sync files" \
             push     "Push (local → remote)" \
             pull     "Pull (remote → local)" \
             mirror   "⚠  Mirror — destructive exact sync" \
             drypush  "Preview push (dry-run)" \
             drypull  "Preview pull (dry-run)" \
+            theme    "Change TUI Theme" \
             config   "Show current config" \
             init     "Setup / change config" \
+            help     "Keyboard shortcuts help" \
             quit     "Quit")"
         rc=$?
         [[ $rc -ne 0 ]] && break   # ESC / Cancel
 
         case "$choice" in
             status)  dlg_run_capture "Status" cmd_status ;;
+            livestat) dlg_live_status ;;
             diffcmd) dlg_run_capture "Diff" cmd_diff ;;
+            search)  dlg_search_menu ;;
             push)    dlg_push_menu ;;
             pull)    dlg_pull_menu ;;
             mirror)  dlg_mirror_menu ;;
             drypush) dlg_run_capture "Dry Push Preview" cmd_dry_push_all ;;
             drypull) dlg_run_capture "Dry Pull Preview" cmd_dry_pull_all ;;
+            theme)   dlg_theme_menu ;;
             config)  dlg_run_capture "Config" cmd_config ;;
             init)    dlg_init_menu ;;
+            help)    dlg_shortcuts ;;
             quit)    break ;;
         esac
     done
@@ -842,7 +1003,7 @@ plain_mirror_menu() {
     case "$c" in
         1)
             echo
-            echo "WARNING: This will DELETE files in remote that are not in local."
+            log_warn "This will DELETE files in remote that are not in local."
             echo "A snapshot of remote will be saved to $(display_path "$ARCHIVE_DIR") first."
             read -r -p "Type YES to confirm: " confirm
             [[ "$confirm" == "YES" ]] && cmd_mirror_local_to_remote
@@ -850,7 +1011,7 @@ plain_mirror_menu() {
             ;;
         2)
             echo
-            echo "WARNING: This will DELETE files in local that are not in remote."
+            log_warn "This will DELETE files in local that are not in remote."
             echo "A snapshot of local will be saved to $(display_path "$ARCHIVE_DIR") first."
             read -r -p "Type YES to confirm: " confirm
             [[ "$confirm" == "YES" ]] && cmd_mirror_remote_to_local
@@ -910,6 +1071,75 @@ run_tui() {
     fi
 }
 
+apply_theme() {
+    [[ "$DIALOG_BIN" != "whiptail" ]] && return
+
+    case "$TUI_THEME" in
+        dark)
+            export NEWT_COLORS='
+                root=white,black
+                window=white,black
+                border=white,black
+                shadow=black,black
+                button=black,white
+                actbutton=white,black
+                title=white,black
+                roottext=white,black
+                listbox=white,black
+                actlistbox=black,white
+                sellistbox=black,white
+                actsellistbox=white,black
+                textbox=white,black
+                acttextbox=black,white
+                checkbox=white,black
+                actcheckbox=black,white
+                entry=white,black
+            '
+            ;;
+        ocean)
+            export NEWT_COLORS='
+                root=white,blue
+                window=white,blue
+                border=white,blue
+                shadow=black,black
+                button=black,cyan
+                actbutton=white,blue
+                title=white,blue
+                roottext=white,blue
+                listbox=white,blue
+                actlistbox=black,cyan
+                sellistbox=black,cyan
+                actsellistbox=white,blue
+                checkbox=white,blue
+                actcheckbox=black,cyan
+                entry=black,cyan
+            '
+            ;;
+        matrix)
+            export NEWT_COLORS='
+                root=green,black
+                window=green,black
+                border=green,black
+                shadow=black,black
+                button=black,green
+                actbutton=green,black
+                title=green,black
+                roottext=green,black
+                listbox=green,black
+                actlistbox=black,green
+                sellistbox=black,green
+                actsellistbox=green,black
+                checkbox=green,black
+                actcheckbox=black,green
+                entry=black,green
+            '
+            ;;
+        *)
+            unset NEWT_COLORS
+            ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 # Dependency check
 # ---------------------------------------------------------------------------
@@ -920,7 +1150,7 @@ check_deps() {
     command -v diff  >/dev/null 2>&1 || missing+=("diffutils (diff)")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        echo "Error: missing required tool(s): ${missing[*]}" >&2
+        log_error "missing required tool(s): ${missing[*]}"
         echo "Install them with your distro's package manager and try again." >&2
         exit 1
     fi
@@ -933,6 +1163,16 @@ check_deps() {
 main() {
     check_deps
     load_config
+    apply_theme
+
+    # Parse global flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --verbose) VERBOSE=1; shift ;;
+            --quiet|-q) QUIET=1; shift ;;
+            *) break ;;
+        esac
+    done
 
     local cmd="${1:-help}"
     shift || true
