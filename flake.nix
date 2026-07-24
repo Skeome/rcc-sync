@@ -23,7 +23,7 @@
         {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "rcc-sync";
-            version = "1.0";
+            version = "1.0.0";
 
             src = ./rcc-sync;
             dontUnpack = true;

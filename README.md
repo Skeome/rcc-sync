@@ -24,7 +24,7 @@ Microsoft OneDrive
 
 ---
 
-# Why RCC Sync?
+## Why RCC Sync?
 
 Traditional sync tools typically follow this workflow:
 
@@ -62,9 +62,9 @@ RCC Sync was originally developed for Linux users at Rogue Community College but
 
 ---
 
-# Features
+## Features
 
-## Safe by Default
+### Safe by Default
 
 RCC Sync push/pull operations:
 
@@ -83,7 +83,7 @@ RCC Sync push/pull operations:
 
 ---
 
-## Configuration Support
+### Configuration Support
 
 Configure any directory layout:
 
@@ -106,7 +106,7 @@ ARCHIVE_DIR=~/.rcc-sync-archives
 ```
 
 | Key | Default | Description |
-|-----|---------|-------------|
+| --- | --- | --- |
 | `LOCAL_ROOT` | `~/College` | Your local working directory |
 | `REMOTE_ROOT` | `~/OneDrive/College` | OneDrive-backed mirror directory |
 | `ARCHIVE_DIR` | `~/.rcc-sync-archives` | Where pre-mirror backup snapshots are saved |
@@ -116,7 +116,7 @@ ARCHIVE_DIR=~/.rcc-sync-archives
 
 ---
 
-## Status Reporting
+### Status Reporting
 
 ```bash
 rcc-sync status
@@ -142,7 +142,7 @@ Think of this as the equivalent of `git status` for your local and cloud-backed 
 
 ---
 
-## Detailed Differences
+### Detailed Differences
 
 ```bash
 rcc-sync diff
@@ -152,21 +152,21 @@ Displays raw `diff -rq` output between local and OneDrive-backed directories.
 
 ---
 
-## Push / Pull Operations
+### Push / Pull Operations
 
-### Push Everything
+#### Push Everything
 
 ```bash
 rcc-sync push all
 ```
 
-### Pull Everything
+#### Pull Everything
 
 ```bash
 rcc-sync pull all
 ```
 
-### Push / Pull Multiple Files
+#### Push / Pull Multiple Files
 
 Pass one or more relative paths:
 
@@ -182,7 +182,7 @@ rcc-sync push file CIS120/{lab1.pdf,lab2.pdf,lab3.pdf}
 rcc-sync pull file MTH111Z/{hw1.pdf,hw2.pdf}
 ```
 
-### Push / Pull a Directory
+#### Push / Pull a Directory
 
 ```bash
 rcc-sync push dir CIS120
@@ -191,7 +191,7 @@ rcc-sync pull dir CIS120
 
 ---
 
-## Dry-Run Preview
+### Dry-Run Preview
 
 Preview changes before making them:
 
@@ -202,14 +202,14 @@ rcc-sync dry-pull all
 
 ---
 
-## Mirror Operations
+### Mirror Operations
 
 > [!WARNING]
 > Mirror is a **destructive** operation. It uses `rsync --delete` to make the target an exact copy of the source. Files in the target that do not exist in the source **will be permanently deleted**.
 
 A compressed snapshot of the target directory is automatically saved to `ARCHIVE_DIR` before every mirror operation.
 
-### Mirror Local → Remote
+#### Mirror Local → Remote
 
 Makes remote an exact copy of local:
 
@@ -217,7 +217,7 @@ Makes remote an exact copy of local:
 rcc-sync mirror local
 ```
 
-### Mirror Remote → Local
+#### Mirror Remote → Local
 
 Makes local an exact copy of remote:
 
@@ -225,7 +225,7 @@ Makes local an exact copy of remote:
 rcc-sync mirror remote
 ```
 
-### Dry-Mirror (Preview, No Changes)
+#### Dry-Mirror (Preview, No Changes)
 
 ```bash
 rcc-sync dry-mirror local
@@ -236,7 +236,7 @@ Output is clearly labelled to show which files **would be deleted**.
 
 ---
 
-## Backup Snapshots
+### Backup Snapshots
 
 Before every live `mirror`, a compressed tarball of the target directory is saved:
 
@@ -254,7 +254,7 @@ ARCHIVE_DIR=~/OneDrive/RCC-Sync_Archives
 
 ---
 
-## Interactive TUI
+### Interactive TUI
 
 RCC Sync includes a menu-driven terminal interface.
 
@@ -299,33 +299,33 @@ No additional configuration is required.
 
 ---
 
-# Requirements
+## Requirements
 
-## Required
+### Required
 
 - Bash
 - rsync
 - diffutils
 
-### Arch Linux
+#### Arch Linux
 
 ```bash
 sudo pacman -S rsync diffutils
 ```
 
-### Fedora
+#### Fedora
 
 ```bash
 sudo dnf install rsync diffutils
 ```
 
-### Debian / Ubuntu
+#### Debian / Ubuntu
 
 ```bash
 sudo apt install rsync diffutils
 ```
 
-### NixOS
+#### NixOS
 
 The flake wraps all runtime dependencies automatically. No extra packages are needed beyond what the flake provides.
 
@@ -340,35 +340,35 @@ environment.systemPackages = with pkgs; [
 
 ---
 
-## Optional (Enhanced TUI)
+### Optional (Enhanced TUI)
 
 `whiptail` (provided by the `newt` package) is recommended. `dialog` also works.
 
-### Arch Linux
+#### Arch Linux
 
 ```bash
 sudo pacman -S libnewt
 ```
 
-### Fedora
+#### Fedora
 
 ```bash
 sudo dnf install newt
 ```
 
-### Debian / Ubuntu
+#### Debian / Ubuntu
 
 ```bash
 sudo apt install whiptail
 ```
 
-### NixOS
+#### NixOS
 
 The flake already includes `newt` (whiptail). No extra packages needed.
 
 ---
 
-# OneDrive Setup (Required)
+## OneDrive Setup (Required)
 
 RCC Sync does **not** communicate directly with Microsoft's cloud services.
 
@@ -376,7 +376,7 @@ Instead, it relies on a separate OneDrive client to synchronize a local director
 
 The recommended client is:
 
-## abraunegg/onedrive
+### abraunegg/onedrive
 
 Repository: https://github.com/abraunegg/onedrive
 
@@ -391,9 +391,9 @@ Supported services include:
 
 ---
 
-## Install OneDrive
+### Install OneDrive
 
-### NixOS
+#### NixOS
 
 Add `onedrive` to your configuration:
 
@@ -411,7 +411,7 @@ sudo nixos-rebuild switch
 
 ---
 
-### Arch Linux
+#### Arch Linux
 
 ```bash
 sudo pacman -S onedrive
@@ -419,7 +419,7 @@ sudo pacman -S onedrive
 
 ---
 
-### Fedora
+#### Fedora
 
 ```bash
 sudo dnf install onedrive
@@ -427,7 +427,7 @@ sudo dnf install onedrive
 
 ---
 
-### Debian / Ubuntu
+#### Debian / Ubuntu
 
 Refer to the official installation instructions: https://abraunegg.github.io/
 
@@ -435,7 +435,7 @@ Package availability may vary by release.
 
 ---
 
-## Authenticate Your Account
+### Authenticate Your Account
 
 Run:
 
@@ -455,7 +455,7 @@ Once complete, your account is linked.
 
 ---
 
-## Create a OneDrive Sync Root
+### Create a OneDrive Sync Root
 
 ```bash
 mkdir -p ~/OneDrive
@@ -463,7 +463,7 @@ mkdir -p ~/OneDrive
 
 ---
 
-## Configure OneDrive
+### Configure OneDrive
 
 ```bash
 mkdir -p ~/.config/onedrive
@@ -478,7 +478,7 @@ sync_dir = "~/OneDrive"
 
 ---
 
-## Initial Synchronization
+### Initial Synchronization
 
 Preview changes first:
 
@@ -494,7 +494,7 @@ onedrive --sync
 
 ---
 
-## Optional: Background Synchronization
+### Optional: Background Synchronization
 
 Enable the included systemd user service:
 
@@ -511,7 +511,7 @@ systemctl --user status onedrive
 
 ---
 
-# Recommended Directory Layout
+## Recommended Directory Layout
 
 ```text
 ~/College
@@ -554,9 +554,9 @@ Microsoft OneDrive
 
 ---
 
-# Installation
+## Installation
 
-## Via Nix Flake (Recommended on NixOS)
+### Via Nix Flake (Recommended on NixOS)
 
 ```bash
 nix profile add github:Skeome/rcc-sync
@@ -573,7 +573,7 @@ nix profile add github:Skeome/rcc-sync
 
 ---
 
-## Manual Installation
+### Manual Installation
 
 Clone the repository:
 
@@ -603,12 +603,12 @@ rcc-sync version
 Expected output:
 
 ```text
-rcc-sync v1.0
+rcc-sync v1.0.0
 ```
 
 ---
 
-# Quick Start
+## Quick Start
 
 Create a configuration:
 
@@ -648,7 +648,7 @@ rcc-sync --tui
 
 ---
 
-# Example Workflow
+## Example Workflow
 
 Work on files locally:
 
@@ -690,12 +690,12 @@ Microsoft OneDrive
 
 ---
 
-# Philosophy
+## Philosophy
 
 RCC Sync intentionally borrows ideas from version-control systems.
 
 | Git | RCC Sync |
-|-----|----------|
+| --- | --- |
 | Working Tree | Local Workspace |
 | Remote Repository | OneDrive |
 | `git status` | `rcc-sync status` |
@@ -718,21 +718,21 @@ Synchronize intentionally.
 
 ---
 
-# Current Version
+## Current Version
 
 ```text
-rcc-sync v0.1
+rcc-sync v1.0.0
 ```
 
 ---
 
-# License
+## License
 
 MIT License
 
 ---
 
-# Contributing
+## Contributing
 
 Issues, bug reports, feature requests, and pull requests are welcome.
 
