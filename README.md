@@ -603,7 +603,7 @@ rcc-sync version
 Expected output:
 
 ```text
-rcc-sync v0.1
+rcc-sync v1.0
 ```
 
 ---
