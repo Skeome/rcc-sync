@@ -2,22 +2,48 @@
 
 > Work locally. Sync intentionally.
 
-RCC Sync is a lightweight Linux utility that provides explicit, non-destructive synchronization between a local workspace and a OneDrive-backed directory.
+RCC Sync is a safe, explicit synchronization utility for Linux.
 
-Unlike traditional cloud synchronization tools, RCC Sync never runs in the background and never automatically uploads, downloads, or deletes files.
+Built on top of `rsync`, RCC Sync provides a simple command-line and terminal user interface for synchronizing files between any two filesystem-accessible locations while keeping the user in control of when changes occur.
 
-RCC Sync assumes you already have a OneDrive client synchronizing your local OneDrive directory with Microsoft's cloud services.
+Unlike traditional synchronization tools, RCC Sync never runs in the background, never communicates with the network itself, and never performs automatic file transfers. Every operation is explicitly initiated by the user.
 
-The most common setup is:
+Common destinations include:
 
+- OneDrive-backed directories
+- External drives
+- NAS storage
+- Archive directories
+- Secondary disks
+- Cloud-mounted filesystems
+- Cross-device synchronization targets
+
+RCC Sync was originally developed for Linux users at Rogue Community College as a controlled alternative to traditional cloud synchronization workflows, but it has since evolved into a general-purpose synchronization tool.
+
+Typical workflows include:
+
+```text
+Laptop
+    ↑
+    │ rcc-sync
+    ↓
+External Drive
+```
+```text
+Local Workspace
+    ↑
+    │ rcc-sync
+    ↓
+NAS Storage
+```
 ```text
 ~/College
     ↑
-    │  (rcc-sync)
+    │ rcc-sync
     ↓
 ~/OneDrive/College
     ↑
-    │  (OneDrive Client)
+    │ OneDrive Client
     ↓
 Microsoft OneDrive
 ```
@@ -26,15 +52,21 @@ Microsoft OneDrive
 
 ## Why RCC Sync?
 
-Traditional sync tools typically follow this workflow:
+Most traditional synchronization tools are designed around automation:
 
 ```text
 Edit File
     ↓
-Immediate Upload
+Automatic Synchronization
     ↓
-Cloud
+Remote Storage
 ```
+While convenient, this approach can make it difficult to:
+
+- Review changes before they are transferred
+- Control when files are uploaded
+- Organize projects without triggering immediate synchronization
+- Maintain intentional workflows similar to version control
 
 RCC Sync takes a different approach:
 
@@ -45,10 +77,14 @@ Review Changes
     ↓
 Preview Synchronization
     ↓
-Manual Push/Pull
+Manual Push / Pull / Mirror
     ↓
-Cloud
+Destination
 ```
+The result is a workflow that emphasizes visibility, control, and safety rather than automation.
+For users familiar with Git, RCC Sync often feels more like a publish-and-sync workflow than a traditional cloud client.
+
+---
 
 This workflow is particularly useful for:
 
@@ -58,7 +94,18 @@ This workflow is particularly useful for:
 - Users who prefer explicit synchronization
 - Users who want to avoid accidental cloud updates
 
-RCC Sync was originally developed for Linux users at Rogue Community College but is useful anywhere Linux and OneDrive intersect.
+RCC Sync was originally developed for Linux users at Rogue Community College but is useful anywhere Linux needs intentional file synchronization.
+
+---
+
+## Common Use Cases
+
+- OneDrive synchronization
+- External drive backups
+- NAS synchronization
+- Course material management
+- Archive replication
+- Cross-device file transfer
 
 ---
 
@@ -140,7 +187,7 @@ DIFFERENT
   ENG101/final_essay.docx
 ```
 
-Think of this as the equivalent of `git status` for your local and cloud-backed directories.
+Think of this as the equivalent of `git status` for your source and destination directories.
 
 ---
 
@@ -150,7 +197,7 @@ Think of this as the equivalent of `git status` for your local and cloud-backed 
 rcc-sync diff
 ```
 
-Displays raw `diff -rq` output between local and OneDrive-backed directories.
+Displays raw `diff -rq` output between local and destination directories.
 
 ---
 
@@ -529,7 +576,7 @@ systemctl --user status onedrive
 
 ---
 
-## Recommended Directory Layout
+## Example Directory Layout
 
 ```text
 ~/College
@@ -715,7 +762,7 @@ RCC Sync intentionally borrows ideas from version-control systems.
 | Git | RCC Sync |
 | --- | --- |
 | Working Tree | Local Workspace |
-| Remote Repository | OneDrive |
+| Remote Repository | Sync Destination |
 | `git status` | `rcc-sync status` |
 | `git diff` | `rcc-sync diff` |
 | `git push` | `rcc-sync push` |
