@@ -23,6 +23,10 @@ CONFIG_FILE="${CONFIG_DIR}/config"
 # Defaults — overridden by config file if present.
 LOCAL_ROOT="${HOME}/College"
 REMOTE_ROOT="${HOME}/OneDrive/College"
+# Archive snapshots go here before every mirror. Keep outside OneDrive by
+# default so they are never uploaded. Set to ~/OneDrive/RCC-Sync_Archives
+# in config if you want cloud copies of your snapshots.
+ARCHIVE_DIR="${HOME}/.rcc-sync-archives"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,8 +74,9 @@ load_config() {
         fi
 
         case "$key" in
-            LOCAL_ROOT)  LOCAL_ROOT="$(expand_path "$value")" ;;
-            REMOTE_ROOT) REMOTE_ROOT="$(expand_path "$value")" ;;
+            LOCAL_ROOT)   LOCAL_ROOT="$(expand_path "$value")" ;;
+            REMOTE_ROOT)  REMOTE_ROOT="$(expand_path "$value")" ;;
+            ARCHIVE_DIR)  ARCHIVE_DIR="$(expand_path "$value")" ;;
             *) : ;; # unknown key, ignore
         esac
     done < "$CONFIG_FILE"
@@ -135,11 +140,13 @@ COMMANDS
   dry-pull all
       Preview pull (no files modified)
 
-  push file <path>
-      Push a single file
+  push file <path> [<path> ...]
+      Push one or more files. Accepts multiple space-separated paths or
+      shell brace expansion: push file dir/{a.txt,b.txt}
 
-  pull file <path>
-      Pull a single file
+  pull file <path> [<path> ...]
+      Pull one or more files. Accepts multiple space-separated paths or
+      shell brace expansion: pull file dir/{a.txt,b.txt}
 
   push dir <path>
       Push a single directory
@@ -147,11 +154,27 @@ COMMANDS
   pull dir <path>
       Pull a single directory
 
+  mirror local
+      DESTRUCTIVE: make remote an exact copy of local (rsync --delete).
+      Files in remote that are absent from local WILL BE DELETED.
+      A compressed snapshot of remote is saved to ARCHIVE_DIR first.
+
+  mirror remote
+      DESTRUCTIVE: make local an exact copy of remote (rsync --delete).
+      Files in local that are absent from remote WILL BE DELETED.
+      A compressed snapshot of local is saved to ARCHIVE_DIR first.
+
+  dry-mirror local
+      Preview mirror local→remote without making any changes.
+
+  dry-mirror remote
+      Preview mirror remote→local without making any changes.
+
   init
       Interactive setup, writes ~/.config/rcc-sync/config
 
   config
-      Show current LOCAL_ROOT / REMOTE_ROOT
+      Show current LOCAL_ROOT / REMOTE_ROOT / ARCHIVE_DIR
 
   --tui, -t
       Launch interactive menu-driven mode. Uses whiptail/dialog if
@@ -160,9 +183,12 @@ COMMANDS
 
 NOTES
 
-  rcc-sync never deletes files and never runs in the background.
-  It assumes your OneDrive client is already syncing ~/OneDrive with
-  the cloud; rcc-sync only moves files locally.
+  push/pull never delete files. mirror does delete — use with care.
+  A backup snapshot is always created before any mirror operation.
+  Snapshots are stored in ARCHIVE_DIR (default: ~/.rcc-sync-archives).
+  Set ARCHIVE_DIR=~/OneDrive/RCC-Sync_Archives in config to upload them.
+  rcc-sync never runs in the background. It assumes your OneDrive client
+  is already syncing ~/OneDrive with the cloud.
 EOF
 }
 
@@ -171,8 +197,9 @@ cmd_version() {
 }
 
 cmd_config() {
-    printf 'LOCAL_ROOT  = %s\n' "$(display_path "$LOCAL_ROOT")"
-    printf 'REMOTE_ROOT = %s\n' "$(display_path "$REMOTE_ROOT")"
+    printf 'LOCAL_ROOT   = %s\n' "$(display_path "$LOCAL_ROOT")"
+    printf 'REMOTE_ROOT  = %s\n' "$(display_path "$REMOTE_ROOT")"
+    printf 'ARCHIVE_DIR  = %s\n' "$(display_path "$ARCHIVE_DIR")"
     if [[ -f "$CONFIG_FILE" ]]; then
         printf '\n(loaded from %s)\n' "$CONFIG_FILE"
     else
@@ -186,6 +213,7 @@ write_config() {
         echo "# rcc-sync config"
         echo "LOCAL_ROOT=$(display_path "$LOCAL_ROOT")"
         echo "REMOTE_ROOT=$(display_path "$REMOTE_ROOT")"
+        echo "ARCHIVE_DIR=$(display_path "$ARCHIVE_DIR")"
     } > "$CONFIG_FILE"
 }
 
@@ -193,12 +221,14 @@ cmd_init() {
     echo "RCC Sync setup"
     echo
 
-    local input_local input_remote
+    local input_local input_remote input_archive
     read -r -p "Local College directory [$(display_path "$LOCAL_ROOT")]: " input_local
     read -r -p "OneDrive directory [$(display_path "$REMOTE_ROOT")]: " input_remote
+    read -r -p "Archive/snapshot directory [$(display_path "$ARCHIVE_DIR")]: " input_archive
 
-    [[ -n "$input_local" ]] && LOCAL_ROOT="$(expand_path "$input_local")"
-    [[ -n "$input_remote" ]] && REMOTE_ROOT="$(expand_path "$input_remote")"
+    [[ -n "$input_local" ]]   && LOCAL_ROOT="$(expand_path "$input_local")"
+    [[ -n "$input_remote" ]]  && REMOTE_ROOT="$(expand_path "$input_remote")"
+    [[ -n "$input_archive" ]] && ARCHIVE_DIR="$(expand_path "$input_archive")"
 
     write_config
 
@@ -351,33 +381,39 @@ cmd_pull_all() {
 # ---------------------------------------------------------------------------
 
 cmd_push_file() {
-    local rel="$1"
-    local src="${LOCAL_ROOT}/${rel}"
-    local dest="${REMOTE_ROOT}/${rel}"
-
-    if [[ ! -f "$src" ]]; then
-        echo "Error: local file not found: $(display_path "$src")" >&2
-        return 1
-    fi
-
-    mkdir -p "$(dirname "$dest")"
-    echo "Push file: ${rel}"
-    rsync -av "$src" "$dest"
+    # Accepts one or more relative paths.
+    local rel errors=0
+    for rel in "$@"; do
+        local src="${LOCAL_ROOT}/${rel}"
+        local dest="${REMOTE_ROOT}/${rel}"
+        if [[ ! -f "$src" ]]; then
+            echo "Error: local file not found: $(display_path "$src")" >&2
+            (( errors++ )) || true
+            continue
+        fi
+        mkdir -p "$(dirname "$dest")"
+        echo "Push file: ${rel}"
+        rsync -av "$src" "$dest"
+    done
+    [[ $errors -eq 0 ]]
 }
 
 cmd_pull_file() {
-    local rel="$1"
-    local src="${REMOTE_ROOT}/${rel}"
-    local dest="${LOCAL_ROOT}/${rel}"
-
-    if [[ ! -f "$src" ]]; then
-        echo "Error: remote file not found: $(display_path "$src")" >&2
-        return 1
-    fi
-
-    mkdir -p "$(dirname "$dest")"
-    echo "Pull file: ${rel}"
-    rsync -av "$src" "$dest"
+    # Accepts one or more relative paths.
+    local rel errors=0
+    for rel in "$@"; do
+        local src="${REMOTE_ROOT}/${rel}"
+        local dest="${LOCAL_ROOT}/${rel}"
+        if [[ ! -f "$src" ]]; then
+            echo "Error: remote file not found: $(display_path "$src")" >&2
+            (( errors++ )) || true
+            continue
+        fi
+        mkdir -p "$(dirname "$dest")"
+        echo "Pull file: ${rel}"
+        rsync -av "$src" "$dest"
+    done
+    [[ $errors -eq 0 ]]
 }
 
 cmd_push_dir() {
@@ -408,6 +444,61 @@ cmd_pull_dir() {
     mkdir -p "$dest"
     echo "Pull dir: ${rel}"
     rsync -av "${src}/" "${dest}/"
+}
+
+# ---------------------------------------------------------------------------
+# Commands: mirror / dry-mirror
+# ---------------------------------------------------------------------------
+
+# Create a compressed tarball snapshot of a directory before mirroring.
+make_snapshot() {
+    local label="$1"   # descriptive name, e.g. "remote" or "local"
+    local src_dir="$2" # directory to snapshot
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    local archive="${ARCHIVE_DIR}/rcc-sync-snapshot-${label}-${ts}.tar.gz"
+    mkdir -p "$ARCHIVE_DIR"
+    echo "Creating snapshot: $(display_path "$archive")"
+    tar -czf "$archive" -C "$(dirname "$src_dir")" "$(basename "$src_dir")" 2>&1
+    echo "Snapshot saved."
+}
+
+cmd_dry_mirror_local_to_remote() {
+    require_dir "$LOCAL_ROOT" "local" || return 1
+    mkdir -p "$REMOTE_ROOT"
+    echo "DRY-RUN mirror: $(display_path "$LOCAL_ROOT") → $(display_path "$REMOTE_ROOT") [--delete]"
+    echo "Files shown below would be DELETED from remote or added/updated:"
+    echo
+    rsync -avn --delete "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+}
+
+cmd_dry_mirror_remote_to_local() {
+    require_dir "$REMOTE_ROOT" "remote" || return 1
+    mkdir -p "$LOCAL_ROOT"
+    echo "DRY-RUN mirror: $(display_path "$REMOTE_ROOT") → $(display_path "$LOCAL_ROOT") [--delete]"
+    echo "Files shown below would be DELETED from local or added/updated:"
+    echo
+    rsync -avn --delete "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+}
+
+cmd_mirror_local_to_remote() {
+    require_dir "$LOCAL_ROOT" "local" || return 1
+    mkdir -p "$REMOTE_ROOT"
+    echo "Snapshotting remote before mirror..."
+    make_snapshot "remote" "$REMOTE_ROOT"
+    echo
+    echo "Mirror: $(display_path "$LOCAL_ROOT") → $(display_path "$REMOTE_ROOT") [--delete]"
+    rsync -av --delete "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+}
+
+cmd_mirror_remote_to_local() {
+    require_dir "$REMOTE_ROOT" "remote" || return 1
+    mkdir -p "$LOCAL_ROOT"
+    echo "Snapshotting local before mirror..."
+    make_snapshot "local" "$LOCAL_ROOT"
+    echo
+    echo "Mirror: $(display_path "$REMOTE_ROOT") → $(display_path "$LOCAL_ROOT") [--delete]"
+    rsync -av --delete "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
 }
 
 # ---------------------------------------------------------------------------
@@ -450,23 +541,66 @@ dlg_show_file() {
 }
 
 # Run a command function (with optional args), capture its stdout+stderr,
-# and show the result in a scrollable dialog box.
+# and show the result in a scrollable dialog box with a loading indicator.
 dlg_run_capture() {
     local title="$1"
     shift
     local tmp
     tmp="$(mktemp)"
-    "$@" > "$tmp" 2>&1
+    {
+        "$@" > "$tmp" 2>&1 &
+        local bgpid=$!
+        local pct=0
+        while kill -0 "$bgpid" 2>/dev/null; do
+            echo "$pct"
+            pct=$(( (pct + 5) % 105 ))
+            sleep 0.1
+        done
+        echo "100"
+        wait "$bgpid"
+    } | "$DIALOG_BIN" --title "Loading..." --gauge "Processing: ${title}\n\nPlease wait..." 8 65 0
     [[ -s "$tmp" ]] || echo "(no output)" > "$tmp"
     dlg_show_file "$title" "$tmp"
     rm -f "$tmp"
+}
+
+# Build a whiptail checklist of all files under a given root directory.
+# Prints the selected relative paths, one per line. Returns 1 if cancelled
+# or if no files exist.
+dlg_file_checklist() {
+    local root="$1" title="$2" prompt="$3"
+    local items=() f rel
+    while IFS= read -r f; do
+        rel="${f#"${root}/"}"
+        items+=("$rel" "" OFF)
+    done < <(find "$root" -type f | sort)
+
+    if [[ ${#items[@]} -eq 0 ]]; then
+        "$DIALOG_BIN" --title "$title" --msgbox \
+            "No files found in $(display_path "$root")." 8 55
+        return 1
+    fi
+
+    local raw rc
+    raw="$("$DIALOG_BIN" --title "$title" --checklist \
+        "$prompt" 30 80 20 "${items[@]}" 3>&1 1>&2 2>&3)"
+    rc=$?
+    [[ $rc -ne 0 ]] && return 1
+    [[ -z "$raw" ]] && return 1
+
+    # whiptail returns space-separated double-quoted tokens; split safely.
+    local sel=() tok
+    eval "sel=($raw)"
+    for tok in "${sel[@]}"; do
+        printf '%s\n' "$tok"
+    done
 }
 
 dlg_push_menu() {
     local choice rc
     choice="$(dlg_menu "Push" "Push local -> remote:" \
         all  "Push everything" \
-        file "Push a single file" \
+        file "Push files (select)" \
         dir  "Push a single directory" \
         back "Back to main menu")"
     rc=$?
@@ -477,9 +611,14 @@ dlg_push_menu() {
             dlg_run_capture "Push All" cmd_push_all
             ;;
         file)
-            local path
-            path="$(dlg_input "Push File" "Relative path under $(display_path "$LOCAL_ROOT"):" "")"
-            [[ $? -eq 0 && -n "$path" ]] && dlg_run_capture "Push File: $path" cmd_push_file "$path"
+            local paths=() line
+            while IFS= read -r line; do
+                paths+=("$line")
+            done < <(dlg_file_checklist "$LOCAL_ROOT" \
+                "Push Files" \
+                "Select files to push (SPACE toggles, ENTER confirms):")
+            [[ ${#paths[@]} -gt 0 ]] && \
+                dlg_run_capture "Push Files" cmd_push_file "${paths[@]}"
             ;;
         dir)
             local path
@@ -493,7 +632,7 @@ dlg_pull_menu() {
     local choice rc
     choice="$(dlg_menu "Pull" "Pull remote -> local:" \
         all  "Pull everything" \
-        file "Pull a single file" \
+        file "Pull files (select)" \
         dir  "Pull a single directory" \
         back "Back to main menu")"
     rc=$?
@@ -504,9 +643,14 @@ dlg_pull_menu() {
             dlg_run_capture "Pull All" cmd_pull_all
             ;;
         file)
-            local path
-            path="$(dlg_input "Pull File" "Relative path under $(display_path "$REMOTE_ROOT"):" "")"
-            [[ $? -eq 0 && -n "$path" ]] && dlg_run_capture "Pull File: $path" cmd_pull_file "$path"
+            local paths=() line
+            while IFS= read -r line; do
+                paths+=("$line")
+            done < <(dlg_file_checklist "$REMOTE_ROOT" \
+                "Pull Files" \
+                "Select files to pull (SPACE toggles, ENTER confirms):")
+            [[ ${#paths[@]} -gt 0 ]] && \
+                dlg_run_capture "Pull Files" cmd_pull_file "${paths[@]}"
             ;;
         dir)
             local path
@@ -517,18 +661,79 @@ dlg_pull_menu() {
 }
 
 dlg_init_menu() {
-    local new_local new_remote rc
+    local new_local new_remote new_archive rc
     new_local="$(dlg_input "Setup — Local" "Local College directory:" "$(display_path "$LOCAL_ROOT")")"
     rc=$?
     [[ $rc -ne 0 ]] && return
     new_remote="$(dlg_input "Setup — Remote" "OneDrive directory:" "$(display_path "$REMOTE_ROOT")")"
     rc=$?
     [[ $rc -ne 0 ]] && return
+    new_archive="$(dlg_input "Setup — Archives" \
+        "Snapshot directory (set to ~/OneDrive/RCC-Sync_Archives for cloud backup):" \
+        "$(display_path "$ARCHIVE_DIR")")"
+    rc=$?
+    [[ $rc -ne 0 ]] && return
 
-    [[ -n "$new_local" ]] && LOCAL_ROOT="$(expand_path "$new_local")"
-    [[ -n "$new_remote" ]] && REMOTE_ROOT="$(expand_path "$new_remote")"
+    [[ -n "$new_local" ]]   && LOCAL_ROOT="$(expand_path "$new_local")"
+    [[ -n "$new_remote" ]]  && REMOTE_ROOT="$(expand_path "$new_remote")"
+    [[ -n "$new_archive" ]] && ARCHIVE_DIR="$(expand_path "$new_archive")"
     write_config
     dlg_run_capture "Config Saved" cmd_config
+}
+
+# Mirror sub-menu: warn, confirm, snapshot, then execute.
+dlg_mirror_menu() {
+    local choice rc
+    choice="$(dlg_menu "Mirror" "Choose a mirror direction:" \
+        l2r  "Local → Remote  (remote becomes exact copy of local)" \
+        r2l  "Remote → Local  (local becomes exact copy of remote)" \
+        dl2r "Dry-run: Local → Remote preview" \
+        dr2l "Dry-run: Remote → Local preview" \
+        back "Back to main menu")"
+    rc=$?
+    [[ $rc -ne 0 || "$choice" == "back" ]] && return
+
+    case "$choice" in
+        dl2r)
+            dlg_run_capture "Dry Mirror: Local → Remote" cmd_dry_mirror_local_to_remote
+            return
+            ;;
+        dr2l)
+            dlg_run_capture "Dry Mirror: Remote → Local" cmd_dry_mirror_remote_to_local
+            return
+            ;;
+    esac
+
+    # Destructive paths — build direction-specific strings.
+    local src dest cmd_fn
+    if [[ "$choice" == "l2r" ]]; then
+        src="$(display_path "$LOCAL_ROOT")"
+        dest="$(display_path "$REMOTE_ROOT")"
+        cmd_fn="cmd_mirror_local_to_remote"
+    else
+        src="$(display_path "$REMOTE_ROOT")"
+        dest="$(display_path "$LOCAL_ROOT")"
+        cmd_fn="cmd_mirror_remote_to_local"
+    fi
+
+    # Explicit warning with yesno.
+    "$DIALOG_BIN" --title "⚠  WARNING: DESTRUCTIVE OPERATION" --defaultno --yesno \
+"Mirror: ${src}  →  ${dest}
+
+This will make ${dest} an EXACT copy of ${src}.
+
+Any file in ${dest} that does NOT exist in ${src}
+WILL BE PERMANENTLY DELETED.
+
+A compressed snapshot of ${dest} will be saved to:
+  $(display_path "$ARCHIVE_DIR")
+before the operation begins.
+
+Are you absolutely sure you want to continue?" 18 72
+    rc=$?
+    [[ $rc -ne 0 ]] && return   # User chose No or pressed Esc.
+
+    dlg_run_capture "Mirror ${src} → ${dest}" "$cmd_fn"
 }
 
 run_tui_dialog() {
@@ -537,8 +742,9 @@ run_tui_dialog() {
         choice="$(dlg_menu "RCC Sync ${VERSION#rcc-sync }" "Choose an action:" \
             status   "Show status" \
             diffcmd  "Show detailed diff" \
-            push     "Push (local -> remote)" \
-            pull     "Pull (remote -> local)" \
+            push     "Push (local → remote)" \
+            pull     "Pull (remote → local)" \
+            mirror   "⚠  Mirror — destructive exact sync" \
             drypush  "Preview push (dry-run)" \
             drypull  "Preview pull (dry-run)" \
             config   "Show current config" \
@@ -552,6 +758,7 @@ run_tui_dialog() {
             diffcmd) dlg_run_capture "Diff" cmd_diff ;;
             push)    dlg_push_menu ;;
             pull)    dlg_pull_menu ;;
+            mirror)  dlg_mirror_menu ;;
             drypush) dlg_run_capture "Dry Push Preview" cmd_dry_push_all ;;
             drypull) dlg_run_capture "Dry Pull Preview" cmd_dry_pull_all ;;
             config)  dlg_run_capture "Config" cmd_config ;;
@@ -621,6 +828,40 @@ plain_pull_menu() {
     esac
 }
 
+plain_mirror_menu() {
+    echo
+    echo "  Mirror — DESTRUCTIVE (uses rsync --delete)"
+    echo
+    echo "  1) Mirror local → remote  (remote becomes exact copy of local)"
+    echo "  2) Mirror remote → local  (local becomes exact copy of remote)"
+    echo "  3) Dry-run: local → remote preview"
+    echo "  4) Dry-run: remote → local preview"
+    echo "  5) Back"
+    local c
+    read -r -p "Choose an option [1-5]: " c
+    case "$c" in
+        1)
+            echo
+            echo "WARNING: This will DELETE files in remote that are not in local."
+            echo "A snapshot of remote will be saved to $(display_path "$ARCHIVE_DIR") first."
+            read -r -p "Type YES to confirm: " confirm
+            [[ "$confirm" == "YES" ]] && cmd_mirror_local_to_remote
+            plain_pause
+            ;;
+        2)
+            echo
+            echo "WARNING: This will DELETE files in local that are not in remote."
+            echo "A snapshot of local will be saved to $(display_path "$ARCHIVE_DIR") first."
+            read -r -p "Type YES to confirm: " confirm
+            [[ "$confirm" == "YES" ]] && cmd_mirror_remote_to_local
+            plain_pause
+            ;;
+        3) cmd_dry_mirror_local_to_remote; plain_pause ;;
+        4) cmd_dry_mirror_remote_to_local; plain_pause ;;
+        *) : ;;
+    esac
+}
+
 run_tui_plain() {
     local choice
     while true; do
@@ -631,14 +872,15 @@ run_tui_plain() {
         echo "  2) Diff"
         echo "  3) Push"
         echo "  4) Pull"
-        echo "  5) Dry Push (preview)"
-        echo "  6) Dry Pull (preview)"
-        echo "  7) Config"
-        echo "  8) Init / Setup"
-        echo "  9) Quit"
+        echo "  5) Mirror  [DESTRUCTIVE]"
+        echo "  6) Dry Push (preview)"
+        echo "  7) Dry Pull (preview)"
+        echo "  8) Config"
+        echo "  9) Init / Setup"
+        echo " 10) Quit"
         echo
 
-        if ! read -r -p "Choose an option [1-9]: " choice; then
+        if ! read -r -p "Choose an option [1-10]: " choice; then
             break   # stdin closed (EOF) — exit cleanly
         fi
 
@@ -647,11 +889,12 @@ run_tui_plain() {
             2) cmd_diff; plain_pause ;;
             3) plain_push_menu ;;
             4) plain_pull_menu ;;
-            5) cmd_dry_push_all; plain_pause ;;
-            6) cmd_dry_pull_all; plain_pause ;;
-            7) cmd_config; plain_pause ;;
-            8) cmd_init; plain_pause ;;
-            9) break ;;
+            5) plain_mirror_menu ;;
+            6) cmd_dry_push_all; plain_pause ;;
+            7) cmd_dry_pull_all; plain_pause ;;
+            8) cmd_config; plain_pause ;;
+            9) cmd_init; plain_pause ;;
+           10) break ;;
             "") : ;;
             *) echo "Invalid option: $choice"; plain_pause ;;
         esac
@@ -719,17 +962,25 @@ main() {
         push)
             case "${1:-}" in
                 all)  cmd_push_all ;;
-                file) [[ -n "${2:-}" ]] || { echo "Usage: rcc-sync push file <path>" >&2; exit 1; }; cmd_push_file "$2" ;;
+                file)
+                    shift
+                    [[ $# -gt 0 ]] || { echo "Usage: rcc-sync push file <path> [<path> ...]" >&2; exit 1; }
+                    cmd_push_file "$@"
+                    ;;
                 dir)  [[ -n "${2:-}" ]] || { echo "Usage: rcc-sync push dir <path>" >&2; exit 1; }; cmd_push_dir "$2" ;;
-                *) echo "Usage: rcc-sync push {all|file <path>|dir <path>}" >&2; exit 1 ;;
+                *) echo "Usage: rcc-sync push {all|file <path> [<path> ...]|dir <path>}" >&2; exit 1 ;;
             esac
             ;;
         pull)
             case "${1:-}" in
                 all)  cmd_pull_all ;;
-                file) [[ -n "${2:-}" ]] || { echo "Usage: rcc-sync pull file <path>" >&2; exit 1; }; cmd_pull_file "$2" ;;
+                file)
+                    shift
+                    [[ $# -gt 0 ]] || { echo "Usage: rcc-sync pull file <path> [<path> ...]" >&2; exit 1; }
+                    cmd_pull_file "$@"
+                    ;;
                 dir)  [[ -n "${2:-}" ]] || { echo "Usage: rcc-sync pull dir <path>" >&2; exit 1; }; cmd_pull_dir "$2" ;;
-                *) echo "Usage: rcc-sync pull {all|file <path>|dir <path>}" >&2; exit 1 ;;
+                *) echo "Usage: rcc-sync pull {all|file <path> [<path> ...]|dir <path>}" >&2; exit 1 ;;
             esac
             ;;
         dry-push)
@@ -742,6 +993,20 @@ main() {
             case "${1:-}" in
                 all) cmd_dry_pull_all ;;
                 *) echo "Usage: rcc-sync dry-pull all" >&2; exit 1 ;;
+            esac
+            ;;
+        mirror)
+            case "${1:-}" in
+                local)  cmd_mirror_local_to_remote ;;
+                remote) cmd_mirror_remote_to_local ;;
+                *) echo "Usage: rcc-sync mirror {local|remote}" >&2; exit 1 ;;
+            esac
+            ;;
+        dry-mirror)
+            case "${1:-}" in
+                local)  cmd_dry_mirror_local_to_remote ;;
+                remote) cmd_dry_mirror_remote_to_local ;;
+                *) echo "Usage: rcc-sync dry-mirror {local|remote}" >&2; exit 1 ;;
             esac
             ;;
         *)
