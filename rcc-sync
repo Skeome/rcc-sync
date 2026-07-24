@@ -1108,8 +1108,8 @@ apply_theme() {
                 roottext=white,blue
                 listbox=white,blue
                 actlistbox=black,cyan
-                sellistbox=black,yellow
-                actsellistbox=black,yellow
+                sellistbox=black,white
+                actsellistbox=black,white
                 checkbox=white,blue
                 actcheckbox=black,cyan
                 entry=black,cyan
@@ -1127,8 +1127,8 @@ apply_theme() {
                 roottext=green,black
                 listbox=green,black
                 actlistbox=black,green
-                sellistbox=black,white
-                actsellistbox=black,white
+                sellistbox=white,green
+                actsellistbox=white,green
                 checkbox=green,black
                 actcheckbox=black,green
                 entry=black,green
