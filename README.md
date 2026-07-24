@@ -124,7 +124,7 @@ rcc-sync status
 
 Example output:
 
-![Status Output](Images/Status.png)
+<img width="1854" height="969" alt="Status" src="https://github.com/user-attachments/assets/7f0549a9-836b-4629-a1f7-4d524938fd7e" />
 
 ```text
 LOCAL ONLY
@@ -202,7 +202,7 @@ rcc-sync dry-push all
 rcc-sync dry-pull all
 ```
 
-![Dry Push Preview](Images/DryPush.png)
+<img width="1854" height="969" alt="DryPush" src="https://github.com/user-attachments/assets/8201ae48-71f4-4fea-aa7a-b64970ec722b" />
 
 ---
 
@@ -298,9 +298,10 @@ If `whiptail` or `dialog` is installed, RCC Sync automatically uses a full-scree
 - A **Keyboard shortcuts** help screen
 - An explicit **⚠ WARNING** confirmation screen (defaulting to **No**) before any mirror operation
 
-![Main TUI Menu](Images/TUI.png)
-![File Selection](Images/FileSelect.png)
-![Loading Indicator](Images/Loading.png)
+<img width="1854" height="969" alt="TUI" src="https://github.com/user-attachments/assets/57bb9ffc-b572-4a8a-8881-8649c8cd96d2" />
+<img width="1854" height="969" alt="FileSelect" src="https://github.com/user-attachments/assets/1dd81cd9-e56a-431c-8622-03e8dad50ec3" />
+<img width="1854" height="969" alt="Loading" src="https://github.com/user-attachments/assets/61c8e838-1335-46a8-9cda-25c7eb83071a" />
+
 
 If neither `whiptail` nor `dialog` is installed, RCC Sync automatically falls back to a plain-text numbered menu with the same functionality, including a `YES`-typed confirmation requirement for mirror operations.
 
