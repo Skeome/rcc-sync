@@ -29,6 +29,7 @@ Laptop
     ↓
 External Drive
 ```
+
 ```text
 Local Workspace
     ↑
@@ -36,6 +37,7 @@ Local Workspace
     ↓
 NAS Storage
 ```
+
 ```text
 ~/College
     ↑
@@ -61,6 +63,7 @@ Automatic Synchronization
     ↓
 Remote Storage
 ```
+
 While convenient, this approach can make it difficult to:
 
 - Review changes before they are transferred
@@ -81,6 +84,7 @@ Manual Push / Pull / Mirror
     ↓
 Destination
 ```
+
 The result is a workflow that emphasizes visibility, control, and safety rather than automation.
 For users familiar with Git, RCC Sync often feels more like a publish-and-sync workflow than a traditional cloud client.
 
