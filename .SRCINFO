@@ -1,7 +1,7 @@
 pkgbase = rcc-sync
 	pkgdesc = Explicit, non-destructive local <-> OneDrive sync tool for Rogue Community College
 	pkgver = 1.2.0
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/Skeome/rcc-sync
 	arch = any
 	license = MIT

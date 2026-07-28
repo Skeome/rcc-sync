@@ -1,7 +1,7 @@
 # Maintainer: Skeome <FraterAstrust@proton.me>
 pkgname=rcc-sync
 pkgver=1.2.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Explicit, non-destructive local <-> OneDrive sync tool for Rogue Community College"
 arch=('any')
 url="https://github.com/Skeome/rcc-sync"
