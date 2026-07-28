@@ -9,10 +9,10 @@
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
       pkgsFor = system: import nixpkgs { inherit system; };
 
-      # rsync + diffutils are required; newt provides whiptail for the
+      # rsync + diffutils + tar are required; newt provides whiptail for the
       # nicer --tui mode (rcc-sync falls back to a plain menu without it).
       # Wrapped in either way so the package is self-contained.
-      runtimeDepsFor = pkgs: with pkgs; [ rsync diffutils newt ];
+      runtimeDepsFor = pkgs: with pkgs; [ rsync diffutils gnutar newt ];
     in
     {
       packages = forAllSystems (system:
@@ -23,7 +23,7 @@
         {
           default = pkgs.stdenvNoCC.mkDerivation {
             pname = "rcc-sync";
-            version = "1.1.0";
+            version = "1.2.0";
 
             src = ./rcc-sync;
             dontUnpack = true;

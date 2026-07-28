@@ -14,6 +14,8 @@ _rcc-sync() {
         'dry-pull:Preview pull'
         'mirror:DESTRUCTIVE exact sync'
         'dry-mirror:Preview mirror'
+        'restore:Restore from an archived snapshot'
+        'history:Show or clear the sync history log'
         'init:Interactive setup'
         'config:Show current configuration'
         '--tui:Launch interactive menu-driven mode'
@@ -21,6 +23,9 @@ _rcc-sync() {
         '--quiet:Quiet mode'
         '-q:Quiet mode'
         '--verbose:Verbose mode'
+        '--yes:Skip the large-transfer confirmation prompt'
+        '-y:Skip the large-transfer confirmation prompt'
+        '--json:Machine-readable JSON output (with status)'
     )
 
     if (( CURRENT == 2 )); then
@@ -35,6 +40,12 @@ _rcc-sync() {
                 ;;
             mirror|dry-mirror)
                 _values 'subcommands' 'local[Local to Remote]' 'remote[Remote to Local]'
+                ;;
+            config)
+                _values 'subcommands' 'validate[Check configuration for problems]'
+                ;;
+            history)
+                _values 'subcommands' 'clear[Clear the history log]'
                 ;;
         esac
     else

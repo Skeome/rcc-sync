@@ -5,7 +5,7 @@ _rcc_sync_completions()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="help version status diff push pull dry-push dry-pull mirror dry-mirror config init --tui -t -h --help -v --version -q --quiet --verbose"
+    opts="help version status diff push pull dry-push dry-pull mirror dry-mirror restore history config init --tui -t -h --help -v --version -q --quiet --verbose -y --yes --json"
 
     case "${prev}" in
         push|pull)
@@ -20,10 +20,18 @@ _rcc_sync_completions()
             COMPREPLY=( $(compgen -W "local remote" -- ${cur}) )
             return 0
             ;;
-        all|local|remote)
+        config)
+            COMPREPLY=( $(compgen -W "validate" -- ${cur}) )
             return 0
             ;;
-        file|dir)
+        history)
+            COMPREPLY=( $(compgen -W "clear" -- ${cur}) )
+            return 0
+            ;;
+        all|local|remote|validate)
+            return 0
+            ;;
+        file|dir|restore)
             compopt -o default
             COMPREPLY=()
             return 0

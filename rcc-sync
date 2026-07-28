@@ -1,24 +1,33 @@
 #!/usr/bin/env bash
 #
-# rcc-sync — explicit, non-destructive local <-> OneDrive sync workflow
+# rcc-sync — explicit, non-destructive local <-> Cloud sync workflow
 # Built for Rogue Community College.
 #
 # rcc-sync never talks to the network itself. It assumes a separate
-# OneDrive client (e.g. abraunegg's onedrive) is already keeping
-# ~/OneDrive in sync with the cloud. This script only moves files between
-# a local workspace and a local OneDrive-backed directory, using rsync.
+# cloud client (e.g. abraunegg's onedrive) is already keeping
+# ~/OneDrive (for example) in sync with the cloud. This script only moves files between
+# a local workspace and a local destination directory, using rsync.
 #
-# Version: 0.1
+# Version: 1.2.0
+#
+# New in 1.2.0: config validation, snapshot restore, a sync history log,
+# transfer statistics, JSON status output, include/exclude patterns, and
+# a confirmation prompt before unusually large push/pull/mirror runs.
+# Also: push/pull file & dir now refuse paths that resolve (via "../" or
+# a symlink) outside LOCAL_ROOT/REMOTE_ROOT, and the TUI checklist/search
+# parsing no longer uses eval.
 
 set -uo pipefail
 # NOTE: intentionally not using `set -e`. Several commands used here
 # (diff, rsync in some modes) have meaningful non-zero exit codes that
 # do not mean "script failure", so we check exit codes explicitly instead.
 
-VERSION="rcc-sync v1.1.0"
+VERSION="rcc-sync v1.2.0"
 
 VERBOSE=0
 QUIET=0
+ASSUME_YES=0
+JSON_OUTPUT=0
 
 # ANSI Colors
 C_RESET='\033[0m'
@@ -39,6 +48,7 @@ log_warn() {
 
 CONFIG_DIR="${HOME}/.config/rcc-sync"
 CONFIG_FILE="${CONFIG_DIR}/config"
+HISTORY_FILE="${CONFIG_DIR}/history.log"
 
 # Defaults — overridden by config file if present.
 LOCAL_ROOT="${HOME}/College"
@@ -51,6 +61,22 @@ ARCHIVE_DIR="${HOME}/.rcc-sync-archives"
 # TUI color theme
 TUI_THEME="default"
 
+# Optional include/exclude support — see build_exclude_args. Empty by
+# default, meaning nothing is excluded unless configured.
+EXCLUDE_FILE=""
+EXCLUDE_PATTERNS=""
+
+# "Large transfer" confirmation thresholds for push/pull/mirror — prompt
+# before transferring at least this many files or this much data. Set
+# either to 0 to disable that particular check. Bypassed by --yes/-y,
+# --quiet, or automatically when there's no terminal to prompt on (e.g.
+# when a command is run from inside the dialog-based TUI).
+CONFIRM_FILE_THRESHOLD=100
+CONFIRM_SIZE_THRESHOLD_MB=500
+
+# Populated from EXCLUDE_FILE / EXCLUDE_PATTERNS by build_exclude_args.
+EXCLUDE_ARGS=()
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -59,6 +85,7 @@ TUI_THEME="default"
 # values come from a config file, not shell expansion.
 expand_path() {
     local p="$1"
+    # shellcheck disable=SC2088  # "~/"* below is an intentional literal match, not expansion
     case "$p" in
         "~") printf '%s' "${HOME}" ;;
         "~/"*) printf '%s' "${HOME}/${p#\~/}" ;;
@@ -101,6 +128,14 @@ load_config() {
             REMOTE_ROOT)  REMOTE_ROOT="$(expand_path "$value")" ;;
             ARCHIVE_DIR)  ARCHIVE_DIR="$(expand_path "$value")" ;;
             TUI_THEME)    TUI_THEME="$value" ;;
+            EXCLUDE_FILE) EXCLUDE_FILE="$(expand_path "$value")" ;;
+            EXCLUDE_PATTERNS) EXCLUDE_PATTERNS="$value" ;;
+            CONFIRM_FILE_THRESHOLD)
+                [[ "$value" =~ ^[0-9]+$ ]] && CONFIRM_FILE_THRESHOLD="$value"
+                ;;
+            CONFIRM_SIZE_THRESHOLD_MB)
+                [[ "$value" =~ ^[0-9]+$ ]] && CONFIRM_SIZE_THRESHOLD_MB="$value"
+                ;;
             *) : ;; # unknown key, ignore
         esac
     done < "$CONFIG_FILE"
@@ -120,10 +155,211 @@ require_dir() {
     local dir="$1"
     local label="$2"
     if [[ ! -d "$dir" ]]; then
-        log_error "$label directory does not exist: $dir"
+        log_error "$label directory does not exist: $(display_path "$dir")"
         return 1
     fi
     return 0
+}
+
+# Resolve $path (a file or directory that must already exist) to an
+# absolute, symlink-resolved location and confirm it is $root itself or
+# somewhere underneath it. Used to stop push/pull file & dir arguments
+# from resolving — via "../" or a symlink — to somewhere outside the
+# configured root. Note: this deliberately does NOT try to `cd` into a
+# plain file (you can't); files are resolved via their parent directory.
+path_is_within_root() {
+    local path="$1" root="$2"
+    local abs_root abs_path
+
+    abs_root="$(cd "$root" 2>/dev/null && pwd -P)" || return 1
+
+    if [[ -d "$path" ]]; then
+        abs_path="$(cd "$path" 2>/dev/null && pwd -P)" || return 1
+    else
+        local parent base abs_parent
+        parent="$(dirname "$path")"
+        base="$(basename "$path")"
+        abs_parent="$(cd "$parent" 2>/dev/null && pwd -P)" || return 1
+        abs_path="${abs_parent}/${base}"
+    fi
+
+    [[ "$abs_path" == "$abs_root" || "$abs_path" == "${abs_root}/"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Transfer statistics, history log, excludes, and large-transfer confirmation
+# ---------------------------------------------------------------------------
+
+# Format a byte count as a short human-readable size.
+human_bytes() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" 'BEGIN {
+        units[1]="B"; units[2]="KB"; units[3]="MB"; units[4]="GB"; units[5]="TB"
+        u = 1; val = b + 0
+        while (val >= 1024 && u < 5) { val /= 1024; u++ }
+        printf "%.1f %s", val, units[u]
+    }'
+}
+
+# Extract a numeric field from rsync --stats output. $1 is a regex
+# matching the start of the line (e.g. 'Total transferred file size:'),
+# $2 is the stats text to search. Handles the comma-grouped thousands
+# that different rsync versions print.
+parse_rsync_stat() {
+    local pattern="$1" text="$2"
+    printf '%s\n' "$text" | grep -E "^${pattern}" | head -n1 | grep -oE '[0-9,]+' | head -n1 | tr -d ','
+}
+
+# Populate the global EXCLUDE_ARGS array from EXCLUDE_FILE, a
+# .rccsyncignore file at the root of LOCAL_ROOT (git-style convention,
+# always honored if present), and inline EXCLUDE_PATTERNS. Applied to
+# push/pull/mirror operations that walk a whole tree (all/dir/mirror);
+# NOT applied to push/pull file, since naming a file explicitly should
+# always sync it regardless of any pattern. status/diff currently show
+# every difference regardless of excludes too — see 'rcc-sync help'.
+build_exclude_args() {
+    EXCLUDE_ARGS=()
+
+    if [[ -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
+        EXCLUDE_ARGS+=(--exclude-from="$EXCLUDE_FILE")
+    fi
+
+    if [[ -f "${LOCAL_ROOT}/.rccsyncignore" ]]; then
+        EXCLUDE_ARGS+=(--exclude-from="${LOCAL_ROOT}/.rccsyncignore")
+    fi
+
+    if [[ -n "$EXCLUDE_PATTERNS" ]]; then
+        local pat patterns=()
+        IFS=',' read -ra patterns <<< "$EXCLUDE_PATTERNS"
+        for pat in "${patterns[@]}"; do
+            pat="${pat#"${pat%%[![:space:]]*}"}"
+            pat="${pat%"${pat##*[![:space:]]}"}"
+            [[ -n "$pat" ]] && EXCLUDE_ARGS+=(--exclude="$pat")
+        done
+    fi
+}
+
+# Whether the large-transfer confirmation should even try to run: not in
+# --quiet or --yes mode, at least one threshold enabled, and — crucially
+# — only when stdin is an actual terminal, so this can never hang when a
+# command is invoked from the TUI's background gauge runner.
+should_check_large() {
+    [[ $QUIET -eq 1 || $ASSUME_YES -eq 1 ]] && return 1
+    [[ "$CONFIRM_FILE_THRESHOLD" -le 0 && "$CONFIRM_SIZE_THRESHOLD_MB" -le 0 ]] && return 1
+    [[ -t 0 ]] || return 1
+    return 0
+}
+
+# Given a file count and byte total, prompt for confirmation if either
+# exceeds its configured threshold. Returns 1 if the user declines.
+confirm_if_large() {
+    local count="$1" bytes="$2" label="$3"
+    should_check_large || return 0
+
+    local size_mb=$(( bytes / 1024 / 1024 ))
+    local exceeds=0
+    [[ "$CONFIRM_FILE_THRESHOLD" -gt 0 && "$count" -ge "$CONFIRM_FILE_THRESHOLD" ]] && exceeds=1
+    [[ "$CONFIRM_SIZE_THRESHOLD_MB" -gt 0 && "$size_mb" -ge "$CONFIRM_SIZE_THRESHOLD_MB" ]] && exceeds=1
+    [[ $exceeds -eq 0 ]] && return 0
+
+    echo
+    log_warn "${label} looks large: ${count} file(s), $(human_bytes "$bytes")."
+    local confirm
+    read -r -p "Continue? [y/N]: " confirm
+    case "$confirm" in
+        y|Y|yes|YES) return 0 ;;
+        *) echo "Cancelled."; return 1 ;;
+    esac
+}
+
+# Front door for whole-tree operations (push/pull all|dir, mirror):
+# estimate size via an rsync dry run (respecting excludes and any extra
+# flags such as --delete) and hand off to confirm_if_large. Any args
+# after label/src/dest are passed straight through to the dry-run rsync
+# call (e.g. --delete for mirror), so no word-splitting hacks are needed.
+confirm_large_rsync() {
+    local label="$1" src="$2" dest="$3"
+    shift 3
+    should_check_large || return 0
+
+    local out f b
+    out="$(rsync -an "$@" --stats "${EXCLUDE_ARGS[@]}" "$src" "$dest" 2>/dev/null)"
+    f="$(parse_rsync_stat 'Number of (regular files|files) transferred:' "$out")"
+    b="$(parse_rsync_stat 'Total transferred file size:' "$out")"
+    confirm_if_large "${f:-0}" "${b:-0}" "$label"
+}
+
+# Accumulators for the in-progress operation's transfer stats.
+_stat_files=0
+_stat_bytes=0
+_stat_start=0
+
+stats_begin() {
+    _stat_files=0
+    _stat_bytes=0
+    _stat_start="$(date +%s.%N)"
+}
+
+# Run rsync with --stats, streaming its normal output as before (unless
+# --quiet), and accumulate transferred file/byte counts for the summary
+# stats_finish prints. rsync's own -q is deliberately never combined with
+# --stats here — testing showed -q suppresses the whole --stats block, so
+# --quiet is implemented instead by simply not requesting rsync's -v.
+stats_rsync() {
+    local tmp rc out
+    tmp="$(mktemp)"
+
+    if [[ $QUIET -eq 1 ]]; then
+        rsync --stats "$@" > "$tmp" 2>&1
+        rc=$?
+    else
+        rsync --stats "$@" | tee "$tmp"
+        rc=${PIPESTATUS[0]}
+    fi
+
+    out="$(cat "$tmp")"
+    rm -f "$tmp"
+
+    local f b
+    f="$(parse_rsync_stat 'Number of (regular files|files) transferred:' "$out")"
+    b="$(parse_rsync_stat 'Total transferred file size:' "$out")"
+    [[ -n "$f" ]] && _stat_files=$(( _stat_files + f ))
+    [[ -n "$b" ]] && _stat_bytes=$(( _stat_bytes + b ))
+
+    return "$rc"
+}
+
+# Print the accumulated "Transfer statistics" (unless --quiet) and append
+# an entry to the history log either way.
+stats_finish() {
+    local label="$1"
+    local end duration
+    end="$(date +%s.%N)"
+    duration="$(awk -v s="$_stat_start" -v e="$end" 'BEGIN { printf "%.1f", e - s }')"
+
+    if [[ $QUIET -ne 1 ]]; then
+        echo
+        echo -e "${C_CYAN}${C_BOLD}Transfer statistics${C_RESET}"
+        printf '  Files transferred: %s\n' "$_stat_files"
+        printf '  Bytes transferred: %s\n' "$(human_bytes "$_stat_bytes")"
+        printf '  Duration: %ss\n' "$duration"
+    fi
+
+    log_history "$label" "$_stat_files" "$_stat_bytes" "$duration"
+}
+
+log_history() {
+    local label="$1" files="$2" bytes="$3" duration="$4"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\t%s\tfiles=%s\tbytes=%s\tduration=%ss\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$label" "$files" "$bytes" "$duration" >> "$HISTORY_FILE"
+}
+
+# Populate LAST_SYNC_LINE with the most recent history entry, if any.
+get_last_sync() {
+    LAST_SYNC_LINE=""
+    [[ -f "$HISTORY_FILE" ]] || return 0
+    LAST_SYNC_LINE="$(tail -n1 "$HISTORY_FILE" 2>/dev/null || true)"
 }
 
 # ---------------------------------------------------------------------------
@@ -147,7 +383,7 @@ COMMANDS
       Show version information
 
   status
-      Show local/remote differences
+      Show local/remote differences. Add --json for machine-readable output.
 
   diff
       Show detailed differences (raw diff -rq output)
@@ -189,30 +425,72 @@ COMMANDS
       A compressed snapshot of local is saved to ARCHIVE_DIR first.
 
   dry-mirror local
-      Preview mirror local→remote without making any changes.
+      Preview mirror local->remote without making any changes.
 
   dry-mirror remote
-      Preview mirror remote→local without making any changes.
+      Preview mirror remote->local without making any changes.
+
+  restore [name]
+      Restore a directory from an ARCHIVE_DIR snapshot. With no name,
+      lists available snapshots and prompts for one. Snapshot files are
+      overlaid onto their original location (LOCAL_ROOT or REMOTE_ROOT,
+      whichever the snapshot was taken from) — anything already there
+      that isn't part of the snapshot is left alone. A fresh safety
+      snapshot of the current state is taken first automatically.
+
+  history [N|clear]
+      Show the last N sync operations (default 20), or clear the log.
 
   init
       Interactive setup, writes ~/.config/rcc-sync/config
 
   config
-      Show current LOCAL_ROOT / REMOTE_ROOT / ARCHIVE_DIR
+      Show current configuration and the most recent sync
+
+  config validate
+      Check the configuration for missing/unwritable directories,
+      nested roots, and other common misconfigurations.
 
   --tui, -t
       Launch interactive menu-driven mode. Uses whiptail/dialog if
       installed and a terminal is attached; otherwise falls back to a
       plain numbered menu.
 
+  --quiet, -q
+      Suppress routine output (errors/warnings still show)
+
+  --verbose
+      Increase rsync's own verbosity
+
+  --yes, -y
+      Skip the "large transfer" confirmation prompt for this run
+
+  --json
+      With 'status', print machine-readable JSON instead of text
+
+  Global flags may appear before or after the command, e.g. both
+  'rcc-sync push all --quiet' and 'rcc-sync --quiet push all' work. Use
+  '--' to stop flag parsing, e.g. 'push file -- --yes' to sync a file
+  literally named "--yes".
+
 NOTES
 
   push/pull never delete files. mirror does delete — use with care.
   A backup snapshot is always created before any mirror operation.
   Snapshots are stored in ARCHIVE_DIR (default: ~/.rcc-sync-archives).
-  Set ARCHIVE_DIR=~/OneDrive/RCC-Sync_Archives in config to upload them.
-  rcc-sync never runs in the background. It assumes your OneDrive client
-  is already syncing ~/OneDrive with the cloud.
+  Set ARCHIVE_DIR=~/<Storage Directory>/RCC-Sync_Archives in config to upload them.
+  rcc-sync never runs in the background. It assumes your cloud client
+  is already syncing a local directory.
+
+  Pushing/pulling/mirroring a whole tree (all/dir/mirror) honors
+  EXCLUDE_FILE, EXCLUDE_PATTERNS, and a .rccsyncignore file at the root
+  of LOCAL_ROOT, if configured. 'push file'/'pull file' always sync the
+  exact files you name, ignoring excludes. 'status'/'diff' currently
+  show every difference regardless of excludes.
+
+  Before an unusually large push/pull/mirror, you'll be asked to
+  confirm (see CONFIRM_FILE_THRESHOLD / CONFIRM_SIZE_THRESHOLD_MB in
+  config). Pass --yes/-y to skip that prompt for one run.
 EOF
 }
 
@@ -224,10 +502,138 @@ cmd_config() {
     printf 'LOCAL_ROOT   = %s\n' "$(display_path "$LOCAL_ROOT")"
     printf 'REMOTE_ROOT  = %s\n' "$(display_path "$REMOTE_ROOT")"
     printf 'ARCHIVE_DIR  = %s\n' "$(display_path "$ARCHIVE_DIR")"
+    printf 'TUI_THEME    = %s\n' "$TUI_THEME"
+    if [[ -n "$EXCLUDE_FILE" ]]; then
+        printf 'EXCLUDE_FILE = %s\n' "$(display_path "$EXCLUDE_FILE")"
+    fi
+    if [[ -n "$EXCLUDE_PATTERNS" ]]; then
+        printf 'EXCLUDE_PATTERNS = %s\n' "$EXCLUDE_PATTERNS"
+    fi
+    printf 'CONFIRM_FILE_THRESHOLD    = %s\n' "$CONFIRM_FILE_THRESHOLD"
+    printf 'CONFIRM_SIZE_THRESHOLD_MB = %s\n' "$CONFIRM_SIZE_THRESHOLD_MB"
+
     if [[ -f "$CONFIG_FILE" ]]; then
         printf '\n(loaded from %s)\n' "$CONFIG_FILE"
     else
         printf '\n(no config file found, using defaults — run "rcc-sync init" to set one up)\n'
+    fi
+
+    get_last_sync
+    if [[ -n "$LAST_SYNC_LINE" ]]; then
+        local ts label
+        ts="$(cut -f1 <<< "$LAST_SYNC_LINE")"
+        label="$(cut -f2 <<< "$LAST_SYNC_LINE")"
+        printf '\nLast sync: %s — %s\n' "$label" "$ts"
+    fi
+}
+
+cmd_config_validate() {
+    local errors=0 warnings=0
+
+    echo "Validating configuration..."
+    echo
+
+    if [[ -z "$LOCAL_ROOT" ]]; then
+        log_error "LOCAL_ROOT is not set."
+        (( errors++ )) || true
+    elif [[ ! -d "$LOCAL_ROOT" ]]; then
+        log_warn "LOCAL_ROOT does not exist yet: $(display_path "$LOCAL_ROOT")"
+        (( warnings++ )) || true
+    else
+        echo "  LOCAL_ROOT OK: $(display_path "$LOCAL_ROOT")"
+    fi
+
+    if [[ -z "$REMOTE_ROOT" ]]; then
+        log_error "REMOTE_ROOT is not set."
+        (( errors++ )) || true
+    elif [[ ! -d "$REMOTE_ROOT" ]]; then
+        log_warn "REMOTE_ROOT does not exist yet: $(display_path "$REMOTE_ROOT")"
+        (( warnings++ )) || true
+    else
+        echo "  REMOTE_ROOT OK: $(display_path "$REMOTE_ROOT")"
+    fi
+
+    if [[ -n "$LOCAL_ROOT" && -n "$REMOTE_ROOT" ]]; then
+        if [[ "$LOCAL_ROOT" == "$REMOTE_ROOT" ]]; then
+            log_error "LOCAL_ROOT and REMOTE_ROOT point to the same path."
+            (( errors++ )) || true
+        elif [[ "$REMOTE_ROOT" == "$LOCAL_ROOT"/* ]]; then
+            log_error "REMOTE_ROOT is nested inside LOCAL_ROOT — this will cause recursive sync issues."
+            (( errors++ )) || true
+        elif [[ "$LOCAL_ROOT" == "$REMOTE_ROOT"/* ]]; then
+            log_error "LOCAL_ROOT is nested inside REMOTE_ROOT — this will cause recursive sync issues."
+            (( errors++ )) || true
+        fi
+    fi
+
+    if [[ -z "$ARCHIVE_DIR" ]]; then
+        log_error "ARCHIVE_DIR is not set."
+        (( errors++ )) || true
+    elif [[ -d "$ARCHIVE_DIR" ]]; then
+        if [[ ! -w "$ARCHIVE_DIR" ]]; then
+            log_error "ARCHIVE_DIR exists but is not writable: $(display_path "$ARCHIVE_DIR")"
+            (( errors++ )) || true
+        else
+            echo "  ARCHIVE_DIR OK: $(display_path "$ARCHIVE_DIR")"
+        fi
+    else
+        local parent
+        parent="$(dirname "$ARCHIVE_DIR")"
+        if [[ -d "$parent" && -w "$parent" ]]; then
+            echo "  ARCHIVE_DIR will be created on first mirror: $(display_path "$ARCHIVE_DIR")"
+        else
+            log_warn "ARCHIVE_DIR does not exist and its parent isn't writable: $(display_path "$ARCHIVE_DIR")"
+            (( warnings++ )) || true
+        fi
+    fi
+
+    if [[ -n "$ARCHIVE_DIR" ]]; then
+        if [[ -n "$LOCAL_ROOT" && "$ARCHIVE_DIR" == "$LOCAL_ROOT"/* ]]; then
+            log_warn "ARCHIVE_DIR is inside LOCAL_ROOT — snapshots will be pushed/mirrored like any other file."
+            (( warnings++ )) || true
+        fi
+        if [[ -n "$REMOTE_ROOT" && "$ARCHIVE_DIR" == "$REMOTE_ROOT"/* ]]; then
+            log_warn "ARCHIVE_DIR is inside REMOTE_ROOT — snapshots will be pushed/mirrored like any other file."
+            (( warnings++ )) || true
+        fi
+    fi
+
+    case "$TUI_THEME" in
+        default|dark|ocean|matrix) : ;;
+        *)
+            log_warn "Unknown TUI_THEME '${TUI_THEME}' — will fall back to 'default'."
+            (( warnings++ )) || true
+            ;;
+    esac
+
+    if [[ -n "$EXCLUDE_FILE" ]]; then
+        if [[ ! -f "$EXCLUDE_FILE" ]]; then
+            log_warn "EXCLUDE_FILE is set but does not exist: $(display_path "$EXCLUDE_FILE")"
+            (( warnings++ )) || true
+        else
+            echo "  EXCLUDE_FILE OK: $(display_path "$EXCLUDE_FILE")"
+        fi
+    fi
+
+    if ! command -v rsync >/dev/null 2>&1; then
+        log_error "rsync is not installed or not on PATH."
+        (( errors++ )) || true
+    fi
+    if ! command -v tar >/dev/null 2>&1; then
+        log_error "tar is not installed or not on PATH (needed for snapshots/restore)."
+        (( errors++ )) || true
+    fi
+
+    echo
+    if [[ $errors -eq 0 && $warnings -eq 0 ]]; then
+        echo -e "${C_GREEN}${C_BOLD}Configuration is valid.${C_RESET}"
+        return 0
+    elif [[ $errors -eq 0 ]]; then
+        echo -e "${C_YELLOW}${C_BOLD}Configuration is valid, with ${warnings} warning(s).${C_RESET}"
+        return 0
+    else
+        echo -e "${C_RED}${C_BOLD}Configuration has ${errors} error(s), ${warnings} warning(s).${C_RESET}"
+        return 1
     fi
 }
 
@@ -239,6 +645,24 @@ write_config() {
         echo "REMOTE_ROOT=$(display_path "$REMOTE_ROOT")"
         echo "ARCHIVE_DIR=$(display_path "$ARCHIVE_DIR")"
         echo "TUI_THEME=$TUI_THEME"
+        echo
+        echo "# Optional: rsync-style exclude patterns file (one pattern per line,"
+        echo "# like .gitignore). A .rccsyncignore file at the root of LOCAL_ROOT is"
+        echo "# always honored too, if present. Applies to push/pull/mirror of whole"
+        echo "# trees, not to 'push file' / 'pull file' of explicitly named files."
+        if [[ -n "$EXCLUDE_FILE" ]]; then
+            echo "EXCLUDE_FILE=$(display_path "$EXCLUDE_FILE")"
+        else
+            echo "EXCLUDE_FILE="
+        fi
+        echo
+        echo "# Optional: comma-separated inline exclude patterns, e.g. *.tmp,node_modules"
+        echo "EXCLUDE_PATTERNS=$EXCLUDE_PATTERNS"
+        echo
+        echo "# Confirmation prompt before unusually large push/pull/mirror runs."
+        echo "# Set either to 0 to disable. Bypass a single run with --yes/-y."
+        echo "CONFIRM_FILE_THRESHOLD=$CONFIRM_FILE_THRESHOLD"
+        echo "CONFIRM_SIZE_THRESHOLD_MB=$CONFIRM_SIZE_THRESHOLD_MB"
     } > "$CONFIG_FILE"
 }
 
@@ -246,16 +670,19 @@ cmd_init() {
     echo "RCC Sync setup"
     echo
 
-    local input_local input_remote input_archive
-    read -r -p "Local College directory [$(display_path "$LOCAL_ROOT")]: " input_local
-    read -r -p "OneDrive directory [$(display_path "$REMOTE_ROOT")]: " input_remote
+    local input_local input_remote input_archive input_exclude
+    read -r -p "Local directory [$(display_path "$LOCAL_ROOT")]: " input_local
+    read -r -p "Remote directory [$(display_path "$REMOTE_ROOT")]: " input_remote
     read -r -p "Archive/snapshot directory [$(display_path "$ARCHIVE_DIR")]: " input_archive
+    read -r -p "Exclude patterns file (optional, blank for none) [$(display_path "$EXCLUDE_FILE")]: " input_exclude
 
     [[ -n "$input_local" ]]   && LOCAL_ROOT="$(expand_path "$input_local")"
     [[ -n "$input_remote" ]]  && REMOTE_ROOT="$(expand_path "$input_remote")"
     [[ -n "$input_archive" ]] && ARCHIVE_DIR="$(expand_path "$input_archive")"
+    [[ -n "$input_exclude" ]] && EXCLUDE_FILE="$(expand_path "$input_exclude")"
 
     write_config
+    build_exclude_args
 
     echo
     echo "Saved to $CONFIG_FILE"
@@ -286,13 +713,15 @@ cmd_diff() {
     fi
 }
 
-cmd_status() {
-    require_dir "$LOCAL_ROOT" "local" || return 1
-    require_dir "$REMOTE_ROOT" "remote" || return 1
+# Populates global arrays STATUS_LOCAL_ONLY / STATUS_REMOTE_ONLY /
+# STATUS_DIFFERENT. Shared by cmd_status and cmd_status_json so both
+# render from a single computation.
+compute_status() {
+    STATUS_LOCAL_ONLY=()
+    STATUS_REMOTE_ONLY=()
+    STATUS_DIFFERENT=()
 
-    local local_only=() remote_only=() different=()
     local line
-
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
 
@@ -310,10 +739,10 @@ cmd_status() {
                 full="${LOCAL_ROOT}/${name}"
                 if [[ -d "$full" ]]; then
                     while IFS= read -r f; do
-                        local_only+=("${name}/${f#"${full}"/}")
+                        STATUS_LOCAL_ONLY+=("${name}/${f#"${full}"/}")
                     done < <(find "$full" -type f)
                 else
-                    local_only+=("$name")
+                    STATUS_LOCAL_ONLY+=("$name")
                 fi
             elif [[ "$dir" == "$REMOTE_ROOT"* ]]; then
                 rel="${dir#"$REMOTE_ROOT"}"
@@ -322,10 +751,10 @@ cmd_status() {
                 full="${REMOTE_ROOT}/${name}"
                 if [[ -d "$full" ]]; then
                     while IFS= read -r f; do
-                        remote_only+=("${name}/${f#"${full}"/}")
+                        STATUS_REMOTE_ONLY+=("${name}/${f#"${full}"/}")
                     done < <(find "$full" -type f)
                 else
-                    remote_only+=("$name")
+                    STATUS_REMOTE_ONLY+=("$name")
                 fi
             fi
 
@@ -337,36 +766,104 @@ cmd_status() {
             if [[ "$a" == "$LOCAL_ROOT"* ]]; then
                 local rel="${a#"$LOCAL_ROOT"}"
                 rel="${rel#/}"
-                different+=("$rel")
+                STATUS_DIFFERENT+=("$rel")
             fi
         fi
     done < <(run_diff_rq)
+}
 
-    if [[ ${#local_only[@]} -eq 0 && ${#remote_only[@]} -eq 0 && ${#different[@]} -eq 0 ]]; then
+cmd_status() {
+    require_dir "$LOCAL_ROOT" "local" || return 1
+    require_dir "$REMOTE_ROOT" "remote" || return 1
+
+    compute_status
+
+    get_last_sync
+    if [[ -n "$LAST_SYNC_LINE" ]]; then
+        local ts label
+        ts="$(cut -f1 <<< "$LAST_SYNC_LINE")"
+        label="$(cut -f2 <<< "$LAST_SYNC_LINE")"
+        echo "Last sync: ${label} — ${ts}"
+        echo
+    fi
+
+    if [[ ${#STATUS_LOCAL_ONLY[@]} -eq 0 && ${#STATUS_REMOTE_ONLY[@]} -eq 0 && ${#STATUS_DIFFERENT[@]} -eq 0 ]]; then
         echo "Up to date. No differences between local and remote."
         return 0
     fi
 
-    if [[ ${#local_only[@]} -gt 0 ]]; then
-        echo -e "${C_GREEN}${C_BOLD}LOCAL ONLY${C_RESET}: ${#local_only[@]} files"
+    if [[ ${#STATUS_LOCAL_ONLY[@]} -gt 0 ]]; then
+        echo -e "${C_GREEN}${C_BOLD}LOCAL ONLY${C_RESET}: ${#STATUS_LOCAL_ONLY[@]} files"
         echo
-        for f in "${local_only[@]}"; do printf '  %s\n' "$f"; done
-        echo
-    fi
-
-    if [[ ${#remote_only[@]} -gt 0 ]]; then
-        echo -e "${C_BLUE}${C_BOLD}REMOTE ONLY${C_RESET}: ${#remote_only[@]} files"
-        echo
-        for f in "${remote_only[@]}"; do printf '  %s\n' "$f"; done
+        for f in "${STATUS_LOCAL_ONLY[@]}"; do printf '  %s\n' "$f"; done
         echo
     fi
 
-    if [[ ${#different[@]} -gt 0 ]]; then
-        echo -e "${C_YELLOW}${C_BOLD}DIFFERENT${C_RESET}: ${#different[@]} files"
+    if [[ ${#STATUS_REMOTE_ONLY[@]} -gt 0 ]]; then
+        echo -e "${C_BLUE}${C_BOLD}REMOTE ONLY${C_RESET}: ${#STATUS_REMOTE_ONLY[@]} files"
         echo
-        for f in "${different[@]}"; do printf '  %s\n' "$f"; done
+        for f in "${STATUS_REMOTE_ONLY[@]}"; do printf '  %s\n' "$f"; done
         echo
     fi
+
+    if [[ ${#STATUS_DIFFERENT[@]} -gt 0 ]]; then
+        echo -e "${C_YELLOW}${C_BOLD}DIFFERENT${C_RESET}: ${#STATUS_DIFFERENT[@]} files"
+        echo
+        for f in "${STATUS_DIFFERENT[@]}"; do printf '  %s\n' "$f"; done
+        echo
+    fi
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+json_str_array() {
+    local first=1 item
+    printf '['
+    for item in "$@"; do
+        [[ $first -eq 0 ]] && printf ','
+        printf '"%s"' "$(json_escape "$item")"
+        first=0
+    done
+    printf ']'
+}
+
+cmd_status_json() {
+    require_dir "$LOCAL_ROOT" "local" || return 1
+    require_dir "$REMOTE_ROOT" "remote" || return 1
+
+    compute_status
+    get_last_sync
+
+    local up_to_date="false"
+    [[ ${#STATUS_LOCAL_ONLY[@]} -eq 0 && ${#STATUS_REMOTE_ONLY[@]} -eq 0 && ${#STATUS_DIFFERENT[@]} -eq 0 ]] && up_to_date="true"
+
+    printf '{'
+    printf '"local_root":"%s",' "$(json_escape "$LOCAL_ROOT")"
+    printf '"remote_root":"%s",' "$(json_escape "$REMOTE_ROOT")"
+    printf '"up_to_date":%s,' "$up_to_date"
+    printf '"local_only":%s,' "$(json_str_array "${STATUS_LOCAL_ONLY[@]}")"
+    printf '"remote_only":%s,' "$(json_str_array "${STATUS_REMOTE_ONLY[@]}")"
+    printf '"different":%s,' "$(json_str_array "${STATUS_DIFFERENT[@]}")"
+
+    if [[ -n "$LAST_SYNC_LINE" ]]; then
+        local ts label files bytes duration
+        ts="$(cut -f1 <<< "$LAST_SYNC_LINE")"
+        label="$(cut -f2 <<< "$LAST_SYNC_LINE")"
+        files="$(cut -f3 <<< "$LAST_SYNC_LINE")"; files="${files#files=}"
+        bytes="$(cut -f4 <<< "$LAST_SYNC_LINE")"; bytes="${bytes#bytes=}"
+        duration="$(cut -f5 <<< "$LAST_SYNC_LINE")"; duration="${duration#duration=}"; duration="${duration%s}"
+        printf '"last_sync":{"timestamp":"%s","operation":"%s","files":%s,"bytes":%s,"duration_seconds":%s}' \
+            "$(json_escape "$ts")" "$(json_escape "$label")" "${files:-0}" "${bytes:-0}" "${duration:-0}"
+    else
+        printf '"last_sync":null'
+    fi
+
+    printf '}\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -377,36 +874,50 @@ cmd_dry_push_all() {
     require_dir "$LOCAL_ROOT" "local" || return 1
     mkdir -p "$REMOTE_ROOT"
     echo "Preview: push ($(display_path "$LOCAL_ROOT") -> $(display_path "$REMOTE_ROOT"))"
-    rsync -avn "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+    rsync -avn "${EXCLUDE_ARGS[@]}" "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
 }
 
 cmd_push_all() {
     require_dir "$LOCAL_ROOT" "local" || return 1
     mkdir -p "$REMOTE_ROOT"
+
+    confirm_large_rsync "This push" "${LOCAL_ROOT}/" "${REMOTE_ROOT}/" || return 1
+
     local rsync_args="-av"
-    [[ $QUIET -eq 1 ]] && rsync_args="-aq"
+    [[ $QUIET -eq 1 ]] && rsync_args="-a"
     [[ $VERBOSE -eq 1 ]] && rsync_args="-avv"
-    
+
     echo "Push: $(display_path "$LOCAL_ROOT") -> $(display_path "$REMOTE_ROOT")"
-    rsync $rsync_args "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+    stats_begin
+    stats_rsync $rsync_args "${EXCLUDE_ARGS[@]}" "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+    local rc=$?
+    stats_finish "push all"
+    return $rc
 }
 
 cmd_dry_pull_all() {
     require_dir "$REMOTE_ROOT" "remote" || return 1
     mkdir -p "$LOCAL_ROOT"
     echo "Preview: pull ($(display_path "$REMOTE_ROOT") -> $(display_path "$LOCAL_ROOT"))"
-    rsync -avn "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+    rsync -avn "${EXCLUDE_ARGS[@]}" "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
 }
 
 cmd_pull_all() {
     require_dir "$REMOTE_ROOT" "remote" || return 1
     mkdir -p "$LOCAL_ROOT"
+
+    confirm_large_rsync "This pull" "${REMOTE_ROOT}/" "${LOCAL_ROOT}/" || return 1
+
     local rsync_args="-av"
-    [[ $QUIET -eq 1 ]] && rsync_args="-aq"
+    [[ $QUIET -eq 1 ]] && rsync_args="-a"
     [[ $VERBOSE -eq 1 ]] && rsync_args="-avv"
 
     echo "Pull: $(display_path "$REMOTE_ROOT") -> $(display_path "$LOCAL_ROOT")"
-    rsync $rsync_args "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+    stats_begin
+    stats_rsync $rsync_args "${EXCLUDE_ARGS[@]}" "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+    local rc=$?
+    stats_finish "pull all"
+    return $rc
 }
 
 # ---------------------------------------------------------------------------
@@ -416,36 +927,84 @@ cmd_pull_all() {
 cmd_push_file() {
     # Accepts one or more relative paths.
     local rel errors=0
+    local existing=() total_bytes=0
+
     for rel in "$@"; do
         local src="${LOCAL_ROOT}/${rel}"
-        local dest="${REMOTE_ROOT}/${rel}"
         if [[ ! -f "$src" ]]; then
             log_error "local file not found: $(display_path "$src")"
             (( errors++ )) || true
             continue
         fi
-        mkdir -p "$(dirname "$dest")"
-        echo "Push file: ${rel}"
-        rsync -av "$src" "$dest"
+        if ! path_is_within_root "$src" "$LOCAL_ROOT"; then
+            log_error "refusing to push a path outside LOCAL_ROOT: ${rel}"
+            (( errors++ )) || true
+            continue
+        fi
+        existing+=("$rel")
+        local sz
+        sz="$(stat -c%s "$src" 2>/dev/null || echo 0)"
+        total_bytes=$(( total_bytes + sz ))
     done
+
+    if [[ ${#existing[@]} -gt 0 ]]; then
+        confirm_if_large "${#existing[@]}" "$total_bytes" "This push" || return 1
+
+        stats_begin
+        for rel in "${existing[@]}"; do
+            local src="${LOCAL_ROOT}/${rel}"
+            local dest="${REMOTE_ROOT}/${rel}"
+            mkdir -p "$(dirname "$dest")"
+            echo "Push file: ${rel}"
+            if ! stats_rsync -av "$src" "$dest"; then
+                (( errors++ )) || true
+            fi
+        done
+        stats_finish "push file"
+    fi
+
     [[ $errors -eq 0 ]]
 }
 
 cmd_pull_file() {
     # Accepts one or more relative paths.
     local rel errors=0
+    local existing=() total_bytes=0
+
     for rel in "$@"; do
         local src="${REMOTE_ROOT}/${rel}"
-        local dest="${LOCAL_ROOT}/${rel}"
         if [[ ! -f "$src" ]]; then
             log_error "remote file not found: $(display_path "$src")"
             (( errors++ )) || true
             continue
         fi
-        mkdir -p "$(dirname "$dest")"
-        echo "Pull file: ${rel}"
-        rsync -av "$src" "$dest"
+        if ! path_is_within_root "$src" "$REMOTE_ROOT"; then
+            log_error "refusing to pull a path outside REMOTE_ROOT: ${rel}"
+            (( errors++ )) || true
+            continue
+        fi
+        existing+=("$rel")
+        local sz
+        sz="$(stat -c%s "$src" 2>/dev/null || echo 0)"
+        total_bytes=$(( total_bytes + sz ))
     done
+
+    if [[ ${#existing[@]} -gt 0 ]]; then
+        confirm_if_large "${#existing[@]}" "$total_bytes" "This pull" || return 1
+
+        stats_begin
+        for rel in "${existing[@]}"; do
+            local src="${REMOTE_ROOT}/${rel}"
+            local dest="${LOCAL_ROOT}/${rel}"
+            mkdir -p "$(dirname "$dest")"
+            echo "Pull file: ${rel}"
+            if ! stats_rsync -av "$src" "$dest"; then
+                (( errors++ )) || true
+            fi
+        done
+        stats_finish "pull file"
+    fi
+
     [[ $errors -eq 0 ]]
 }
 
@@ -458,10 +1017,20 @@ cmd_push_dir() {
         log_error "local directory not found: $(display_path "$src")"
         return 1
     fi
+    if ! path_is_within_root "$src" "$LOCAL_ROOT"; then
+        log_error "refusing to push a path outside LOCAL_ROOT: ${rel}"
+        return 1
+    fi
+
+    confirm_large_rsync "This push" "${src}/" "${dest}/" || return 1
 
     mkdir -p "$dest"
     echo "Push dir: ${rel}"
-    rsync -av "${src}/" "${dest}/"
+    stats_begin
+    stats_rsync -av "${EXCLUDE_ARGS[@]}" "${src}/" "${dest}/"
+    local rc=$?
+    stats_finish "push dir: ${rel}"
+    return $rc
 }
 
 cmd_pull_dir() {
@@ -473,17 +1042,28 @@ cmd_pull_dir() {
         log_error "remote directory not found: $(display_path "$src")"
         return 1
     fi
+    if ! path_is_within_root "$src" "$REMOTE_ROOT"; then
+        log_error "refusing to pull a path outside REMOTE_ROOT: ${rel}"
+        return 1
+    fi
+
+    confirm_large_rsync "This pull" "${src}/" "${dest}/" || return 1
 
     mkdir -p "$dest"
     echo "Pull dir: ${rel}"
-    rsync -av "${src}/" "${dest}/"
+    stats_begin
+    stats_rsync -av "${EXCLUDE_ARGS[@]}" "${src}/" "${dest}/"
+    local rc=$?
+    stats_finish "pull dir: ${rel}"
+    return $rc
 }
 
 # ---------------------------------------------------------------------------
 # Commands: mirror / dry-mirror
 # ---------------------------------------------------------------------------
 
-# Create a compressed tarball snapshot of a directory before mirroring.
+# Create a compressed tarball snapshot of a directory before mirroring
+# (or before a restore — see cmd_restore).
 make_snapshot() {
     local label="$1"   # descriptive name, e.g. "remote" or "local"
     local src_dir="$2" # directory to snapshot
@@ -502,7 +1082,7 @@ cmd_dry_mirror_local_to_remote() {
     echo "DRY-RUN mirror: $(display_path "$LOCAL_ROOT") → $(display_path "$REMOTE_ROOT") [--delete]"
     echo "Files shown below would be DELETED from remote or added/updated:"
     echo
-    rsync -avn --delete "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+    rsync -avn --delete "${EXCLUDE_ARGS[@]}" "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
 }
 
 cmd_dry_mirror_remote_to_local() {
@@ -511,27 +1091,187 @@ cmd_dry_mirror_remote_to_local() {
     echo "DRY-RUN mirror: $(display_path "$REMOTE_ROOT") → $(display_path "$LOCAL_ROOT") [--delete]"
     echo "Files shown below would be DELETED from local or added/updated:"
     echo
-    rsync -avn --delete "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+    rsync -avn --delete "${EXCLUDE_ARGS[@]}" "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
 }
 
 cmd_mirror_local_to_remote() {
     require_dir "$LOCAL_ROOT" "local" || return 1
     mkdir -p "$REMOTE_ROOT"
+
+    confirm_large_rsync "This mirror" "${LOCAL_ROOT}/" "${REMOTE_ROOT}/" --delete || return 1
+
     echo "Snapshotting remote before mirror..."
     make_snapshot "remote" "$REMOTE_ROOT"
     echo
     echo "Mirror: $(display_path "$LOCAL_ROOT") → $(display_path "$REMOTE_ROOT") [--delete]"
-    rsync -av --delete "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+    stats_begin
+    stats_rsync -av --delete "${EXCLUDE_ARGS[@]}" "${LOCAL_ROOT}/" "${REMOTE_ROOT}/"
+    local rc=$?
+    stats_finish "mirror local→remote"
+    return $rc
 }
 
 cmd_mirror_remote_to_local() {
     require_dir "$REMOTE_ROOT" "remote" || return 1
     mkdir -p "$LOCAL_ROOT"
+
+    confirm_large_rsync "This mirror" "${REMOTE_ROOT}/" "${LOCAL_ROOT}/" --delete || return 1
+
     echo "Snapshotting local before mirror..."
     make_snapshot "local" "$LOCAL_ROOT"
     echo
     echo "Mirror: $(display_path "$REMOTE_ROOT") → $(display_path "$LOCAL_ROOT") [--delete]"
-    rsync -av --delete "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+    stats_begin
+    stats_rsync -av --delete "${EXCLUDE_ARGS[@]}" "${REMOTE_ROOT}/" "${LOCAL_ROOT}/"
+    local rc=$?
+    stats_finish "mirror remote→local"
+    return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Commands: restore
+# ---------------------------------------------------------------------------
+
+cmd_restore() {
+    local target="${1:-}"
+
+    if [[ ! -d "$ARCHIVE_DIR" ]]; then
+        log_error "Archive directory does not exist: $(display_path "$ARCHIVE_DIR")"
+        return 1
+    fi
+
+    local snapshots=() f
+    while IFS= read -r f; do
+        snapshots+=("$f")
+    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -name 'rcc-sync-snapshot-*.tar.gz' 2>/dev/null | sort -r)
+
+    if [[ ${#snapshots[@]} -eq 0 ]]; then
+        log_error "No snapshots found in $(display_path "$ARCHIVE_DIR")."
+        return 1
+    fi
+
+    local chosen=""
+
+    if [[ -n "$target" ]]; then
+        for f in "${snapshots[@]}"; do
+            if [[ "$f" == "$target" || "$(basename "$f")" == "$target" || "$(basename "$f")" == *"$target"* ]]; then
+                chosen="$f"
+                break
+            fi
+        done
+        if [[ -z "$chosen" ]]; then
+            log_error "No snapshot matching '${target}' found in $(display_path "$ARCHIVE_DIR")."
+            return 1
+        fi
+    else
+        if [[ ! -t 0 ]]; then
+            log_error "No snapshot named and no terminal to choose one interactively."
+            echo "Run 'rcc-sync restore <name>' with an explicit snapshot name — see 'rcc-sync history' or list $(display_path "$ARCHIVE_DIR")." >&2
+            return 1
+        fi
+
+        echo "Available snapshots (newest first):"
+        echo
+        local i=1
+        for f in "${snapshots[@]}"; do
+            printf '  %2d) %s\n' "$i" "$(basename "$f")"
+            (( i++ )) || true
+        done
+        echo
+        local sel
+        read -r -p "Choose a snapshot to restore [1-${#snapshots[@]}]: " sel
+        if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#snapshots[@]} )); then
+            log_error "Invalid selection."
+            return 1
+        fi
+        chosen="${snapshots[$((sel-1))]}"
+    fi
+
+    local base label dest
+    base="$(basename "$chosen")"
+    case "$base" in
+        rcc-sync-snapshot-local-*)  label="local";  dest="$LOCAL_ROOT" ;;
+        rcc-sync-snapshot-remote-*) label="remote"; dest="$REMOTE_ROOT" ;;
+        *)
+            log_error "Could not determine restore destination from snapshot name: $base"
+            return 1
+            ;;
+    esac
+
+    echo
+    log_warn "This will overlay '${base}' onto $(display_path "$dest")."
+    echo "Files in the snapshot overwrite matching files there; anything already"
+    echo "in $(display_path "$dest") that isn't part of the snapshot is left alone."
+    echo "A fresh snapshot of the current state is taken first, just in case."
+    echo
+
+    mkdir -p "$dest"
+    make_snapshot "${label}-pre-restore" "$dest"
+    echo
+
+    local tmp_extract
+    tmp_extract="$(mktemp -d)"
+    if ! tar -xzf "$chosen" -C "$tmp_extract" 2>&1; then
+        log_error "Failed to extract snapshot archive."
+        rm -rf "$tmp_extract"
+        return 1
+    fi
+
+    local extracted_dir
+    extracted_dir="$(find "$tmp_extract" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    if [[ -z "$extracted_dir" ]]; then
+        log_error "Snapshot archive appears empty or malformed."
+        rm -rf "$tmp_extract"
+        return 1
+    fi
+
+    echo "Restoring $base -> $(display_path "$dest") ..."
+    stats_begin
+    stats_rsync -av "${extracted_dir}/" "${dest}/"
+    local rc=$?
+    stats_finish "restore: ${base}"
+    rm -rf "$tmp_extract"
+    return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Commands: history
+# ---------------------------------------------------------------------------
+
+cmd_history() {
+    local arg="${1:-}"
+
+    if [[ "$arg" == "clear" ]]; then
+        if [[ -f "$HISTORY_FILE" ]]; then
+            rm -f "$HISTORY_FILE"
+            echo "History cleared."
+        else
+            echo "No sync history yet."
+        fi
+        return 0
+    fi
+
+    local limit="${arg:-20}"
+    if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        log_error "Invalid history count: ${arg}"
+        echo "Usage: rcc-sync history [N|clear]" >&2
+        return 1
+    fi
+
+    if [[ ! -f "$HISTORY_FILE" ]]; then
+        echo "No sync history yet."
+        return 0
+    fi
+
+    echo "Sync history (most recent ${limit}):"
+    echo
+    tail -n "$limit" "$HISTORY_FILE" | tac | while IFS=$'\t' read -r ts label files bytes duration; do
+        files="${files#files=}"
+        bytes="${bytes#bytes=}"
+        duration="${duration#duration=}"
+        printf '  %s  %-22s  %s files, %8s, %s\n' \
+            "$ts" "$label" "$files" "$(human_bytes "$bytes")" "$duration"
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -570,7 +1310,18 @@ dlg_input() {
 
 dlg_show_file() {
     # $1 = title, $2 = file to display (scrollable)
-    "$DIALOG_BIN" --title "$1" --textbox "$2" 24 78
+    local title="$1" file="$2"
+    local clean_file
+    clean_file="$(mktemp)"
+    
+    # Strip ANSI escape sequences (e.g., \x1b[0;32m) for clean TUI textbox display.
+    # Both dialog and whiptail textboxes do not interpret ANSI colors and will 
+    # display them as literal garbage characters (like ^[[0;32m).
+    # The $'...' syntax ensures bash expands \x1b to the actual ESC byte before passing to sed.
+    sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' "$file" > "$clean_file" 2>/dev/null || cat "$file" > "$clean_file"
+    
+    "$DIALOG_BIN" --title "$title" --textbox "$clean_file" 24 78
+    rm -f "$clean_file"
 }
 
 # Run a command function (with optional args), capture its stdout+stderr,
@@ -597,6 +1348,20 @@ dlg_run_capture() {
     rm -f "$tmp"
 }
 
+# Parse whiptail/dialog's checklist selection output: space-separated,
+# individually double-quoted tags, e.g. "a.txt" "b/c.txt" — without eval.
+parse_dialog_tags() {
+    local remaining="$1"
+    while [[ -n "$remaining" ]]; do
+        if [[ "$remaining" =~ ^\"([^\"]*)\"[[:space:]]* ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+            remaining="${remaining:${#BASH_REMATCH[0]}}"
+        else
+            break
+        fi
+    done
+}
+
 # Build a whiptail checklist of all files under a given root directory.
 # Prints the selected relative paths, one per line. Returns 1 if cancelled
 # or if no files exist.
@@ -621,12 +1386,7 @@ dlg_file_checklist() {
     [[ $rc -ne 0 ]] && return 1
     [[ -z "$raw" ]] && return 1
 
-    # whiptail returns space-separated double-quoted tokens; split safely.
-    local sel=() tok
-    eval "sel=($raw)"
-    for tok in "${sel[@]}"; do
-        printf '%s\n' "$tok"
-    done
+    parse_dialog_tags "$raw"
 }
 
 dlg_dir_radiolist() {
@@ -650,7 +1410,7 @@ dlg_dir_radiolist() {
     [[ $rc -ne 0 ]] && return 1
     [[ -z "$raw" ]] && return 1
 
-    # Remove quotes
+    # Remove surrounding quotes
     raw="${raw%\"}"
     raw="${raw#\"}"
     printf '%s\n' "$raw"
@@ -721,23 +1481,30 @@ dlg_pull_menu() {
 }
 
 dlg_init_menu() {
-    local new_local new_remote new_archive rc
+    local new_local new_remote new_archive new_exclude rc
     new_local="$(dlg_input "Setup — Local" "Local College directory:" "$(display_path "$LOCAL_ROOT")")"
     rc=$?
     [[ $rc -ne 0 ]] && return
-    new_remote="$(dlg_input "Setup — Remote" "OneDrive directory:" "$(display_path "$REMOTE_ROOT")")"
+    new_remote="$(dlg_input "Setup — Remote" "Remote directory:" "$(display_path "$REMOTE_ROOT")")"
     rc=$?
     [[ $rc -ne 0 ]] && return
     new_archive="$(dlg_input "Setup — Archives" \
-        "Snapshot directory (set to ~/OneDrive/RCC-Sync_Archives for cloud backup):" \
+        "Snapshot directory (set to ~/<Storage Directory>/RCC-Sync_Archives for cloud backup):" \
         "$(display_path "$ARCHIVE_DIR")")"
+    rc=$?
+    [[ $rc -ne 0 ]] && return
+    new_exclude="$(dlg_input "Setup — Excludes" \
+        "Exclude patterns file (optional, blank for none):" \
+        "$(display_path "$EXCLUDE_FILE")")"
     rc=$?
     [[ $rc -ne 0 ]] && return
 
     [[ -n "$new_local" ]]   && LOCAL_ROOT="$(expand_path "$new_local")"
     [[ -n "$new_remote" ]]  && REMOTE_ROOT="$(expand_path "$new_remote")"
     [[ -n "$new_archive" ]] && ARCHIVE_DIR="$(expand_path "$new_archive")"
+    [[ -n "$new_exclude" ]] && EXCLUDE_FILE="$(expand_path "$new_exclude")"
     write_config
+    build_exclude_args
     dlg_run_capture "Config Saved" cmd_config
 }
 
@@ -760,7 +1527,7 @@ dlg_search_menu() {
     local direction
     direction="$(dlg_menu "Search" "Search where?" \
         local "Local Workspace (to Push)" \
-        remote "OneDrive (to Pull)" \
+        remote "Remote Storage (to Pull)" \
         back "Back")"
     [[ $? -ne 0 || "$direction" == "back" ]] && return
     
@@ -794,11 +1561,10 @@ dlg_search_menu() {
     rc=$?
     [[ $rc -ne 0 || -z "$raw" ]] && return
 
-    local sel=() tok paths=()
-    eval "sel=($raw)"
-    for tok in "${sel[@]}"; do
-        paths+=("$tok")
-    done
+    local paths=() line
+    while IFS= read -r line; do
+        paths+=("$line")
+    done < <(parse_dialog_tags "$raw")
 
     [[ ${#paths[@]} -gt 0 ]] && dlg_run_capture "$action_title Files" "$cmd_fn" "${paths[@]}"
 }
@@ -889,6 +1655,51 @@ Are you absolutely sure you want to continue?" 18 72
     dlg_run_capture "Mirror ${src} → ${dest}" "$cmd_fn"
 }
 
+# Restore sub-menu: pick a snapshot, warn, confirm, then execute. Always
+# passes an explicit snapshot name to cmd_restore so it never falls into
+# its interactive picker (which would need a real terminal it won't have
+# inside dlg_run_capture's background runner).
+dlg_restore_menu() {
+    if [[ ! -d "$ARCHIVE_DIR" ]]; then
+        "$DIALOG_BIN" --title "Restore" --msgbox "Archive directory does not exist: $(display_path "$ARCHIVE_DIR")." 8 60
+        return
+    fi
+
+    local snapshots=() f
+    while IFS= read -r f; do
+        snapshots+=("$f")
+    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -name 'rcc-sync-snapshot-*.tar.gz' 2>/dev/null | sort -r)
+
+    if [[ ${#snapshots[@]} -eq 0 ]]; then
+        "$DIALOG_BIN" --title "Restore" --msgbox "No snapshots found in $(display_path "$ARCHIVE_DIR")." 8 60
+        return
+    fi
+
+    local items=() base
+    for f in "${snapshots[@]}"; do
+        base="$(basename "$f")"
+        items+=("$base" "")
+    done
+
+    local choice rc
+    choice="$(dlg_menu "Restore" "Choose a snapshot to restore:" "${items[@]}")"
+    rc=$?
+    [[ $rc -ne 0 ]] && return
+
+    "$DIALOG_BIN" --title "⚠ Restore" --defaultno --yesno \
+"Restoring '${choice}' will overwrite matching files in its original
+location with the contents of this snapshot.
+
+Files that already exist there but aren't in the snapshot are left
+alone. A fresh snapshot of the current state is taken first.
+
+Continue?" 14 70
+    rc=$?
+    [[ $rc -ne 0 ]] && return
+
+    dlg_run_capture "Restore: ${choice}" cmd_restore "$choice"
+}
+
 run_tui_dialog() {
     local choice rc
     while true; do
@@ -900,10 +1711,13 @@ run_tui_dialog() {
             push     "Push (local → remote)" \
             pull     "Pull (remote → local)" \
             mirror   "⚠  Mirror — destructive exact sync" \
+            restore  "Restore from a snapshot" \
             drypush  "Preview push (dry-run)" \
             drypull  "Preview pull (dry-run)" \
+            history  "View sync history" \
             theme    "Change TUI Theme" \
             config   "Show current config" \
+            validate "Validate configuration" \
             init     "Setup / change config" \
             help     "Keyboard shortcuts help" \
             quit     "Quit")"
@@ -918,10 +1732,13 @@ run_tui_dialog() {
             push)    dlg_push_menu ;;
             pull)    dlg_pull_menu ;;
             mirror)  dlg_mirror_menu ;;
+            restore) dlg_restore_menu ;;
             drypush) dlg_run_capture "Dry Push Preview" cmd_dry_push_all ;;
             drypull) dlg_run_capture "Dry Pull Preview" cmd_dry_pull_all ;;
+            history) dlg_run_capture "Sync History" cmd_history ;;
             theme)   dlg_theme_menu ;;
             config)  dlg_run_capture "Config" cmd_config ;;
+            validate) dlg_run_capture "Config Validation" cmd_config_validate ;;
             init)    dlg_init_menu ;;
             help)    dlg_shortcuts ;;
             quit)    break ;;
@@ -1034,14 +1851,17 @@ run_tui_plain() {
         echo "  3) Push"
         echo "  4) Pull"
         echo "  5) Mirror  [DESTRUCTIVE]"
-        echo "  6) Dry Push (preview)"
-        echo "  7) Dry Pull (preview)"
-        echo "  8) Config"
-        echo "  9) Init / Setup"
-        echo " 10) Quit"
+        echo "  6) Restore from snapshot"
+        echo "  7) Dry Push (preview)"
+        echo "  8) Dry Pull (preview)"
+        echo "  9) History"
+        echo " 10) Config"
+        echo " 11) Validate Config"
+        echo " 12) Init / Setup"
+        echo " 13) Quit"
         echo
 
-        if ! read -r -p "Choose an option [1-10]: " choice; then
+        if ! read -r -p "Choose an option [1-13]: " choice; then
             break   # stdin closed (EOF) — exit cleanly
         fi
 
@@ -1051,11 +1871,14 @@ run_tui_plain() {
             3) plain_push_menu ;;
             4) plain_pull_menu ;;
             5) plain_mirror_menu ;;
-            6) cmd_dry_push_all; plain_pause ;;
-            7) cmd_dry_pull_all; plain_pause ;;
-            8) cmd_config; plain_pause ;;
-            9) cmd_init; plain_pause ;;
-           10) break ;;
+            6) cmd_restore; plain_pause ;;
+            7) cmd_dry_push_all; plain_pause ;;
+            8) cmd_dry_pull_all; plain_pause ;;
+            9) cmd_history; plain_pause ;;
+           10) cmd_config; plain_pause ;;
+           11) cmd_config_validate; plain_pause ;;
+           12) cmd_init; plain_pause ;;
+           13) break ;;
             "") : ;;
             *) echo "Invalid option: $choice"; plain_pause ;;
         esac
@@ -1148,6 +1971,7 @@ check_deps() {
     local missing=()
     command -v rsync >/dev/null 2>&1 || missing+=("rsync")
     command -v diff  >/dev/null 2>&1 || missing+=("diffutils (diff)")
+    command -v tar   >/dev/null 2>&1 || missing+=("tar")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "missing required tool(s): ${missing[*]}"
@@ -1164,15 +1988,28 @@ main() {
     check_deps
     load_config
     apply_theme
+    build_exclude_args
 
-    # Parse global flags
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --verbose) VERBOSE=1; shift ;;
-            --quiet|-q) QUIET=1; shift ;;
-            *) break ;;
+    # Parse global flags — these can appear anywhere on the command line
+    # (before or after the subcommand), matching documented usage like
+    # `rcc-sync push all --quiet`. `--` stops flag parsing, so a path
+    # that happens to look like a flag can still be passed through.
+    local args=() a seen_dashdash=0
+    for a in "$@"; do
+        if [[ $seen_dashdash -eq 1 ]]; then
+            args+=("$a")
+            continue
+        fi
+        case "$a" in
+            --) seen_dashdash=1 ;;
+            --verbose)  VERBOSE=1 ;;
+            --quiet|-q) QUIET=1 ;;
+            --yes|-y)   ASSUME_YES=1 ;;
+            --json)     JSON_OUTPUT=1 ;;
+            *)          args+=("$a") ;;
         esac
     done
+    set -- "${args[@]}"
 
     local cmd="${1:-help}"
     shift || true
@@ -1188,16 +2025,30 @@ main() {
             run_tui
             ;;
         status)
-            cmd_status
+            if [[ $JSON_OUTPUT -eq 1 ]]; then
+                cmd_status_json
+            else
+                cmd_status
+            fi
             ;;
         diff)
             cmd_diff
             ;;
         config)
-            cmd_config
+            case "${1:-}" in
+                validate) cmd_config_validate ;;
+                "")       cmd_config ;;
+                *) echo "Usage: rcc-sync config [validate]" >&2; exit 1 ;;
+            esac
             ;;
         init)
             cmd_init
+            ;;
+        restore)
+            cmd_restore "${1:-}"
+            ;;
+        history)
+            cmd_history "${1:-}"
             ;;
         push)
             case "${1:-}" in
