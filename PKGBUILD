@@ -13,7 +13,7 @@ source=("$pkgname-$pkgver.tar.gz::https://github.com/Skeome/rcc-sync/archive/ref
 # real tarball to hash. After tagging v1.2.0 and pushing it, regenerate this
 # with `updpkgsums` (or `makepkg -g`) from inside this directory before
 # publishing to the AUR. Do not upload with the placeholder below in place.
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums=('89bf1d308fe83a2081d89067ab796100a41f19343b359cae9896fa4a8b9debb6')
 
 package() {
   cd "$pkgname-$pkgver"

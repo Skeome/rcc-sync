@@ -11,6 +11,6 @@ pkgbase = rcc-sync
 	depends = tar
 	optdepends = libnewt: for full-screen TUI support
 	source = rcc-sync-1.2.0.tar.gz::https://github.com/Skeome/rcc-sync/archive/refs/tags/v1.2.0.tar.gz
-	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+	sha256sums = 89bf1d308fe83a2081d89067ab796100a41f19343b359cae9896fa4a8b9debb6
 
 pkgname = rcc-sync
