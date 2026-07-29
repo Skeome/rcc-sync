@@ -800,7 +800,7 @@ rcc-sync version
 Expected output:
 
 ```text
-rcc-sync v1.2.0
+rcc-sync v1.2.1
 ```
 
 ---
@@ -927,8 +927,10 @@ Synchronize intentionally.
 ## Current Version
 
 ```text
-rcc-sync v1.2.0
+rcc-sync v1.2.1
 ```
+
+New in v1.2.1: four new TUI color themes (`nord`, `dracula`, `solarized`, `gruvbox`), custom Whiptail colors (`CUSTOM_NEWT_COLORS`), custom plaintext ANSI colors (`CUSTOM_ANSI_COLORS`), and enhanced ANSI-styled plaintext TUI fallback menus.
 
 New in v1.2.0: `config validate`, `restore`, `history`, transfer statistics, `status --json`, include/exclude patterns, a confirmation prompt before unusually large transfers, and safer path handling for `push`/`pull` of explicitly named files and directories.
 

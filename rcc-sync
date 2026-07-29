@@ -8,7 +8,12 @@
 # ~/OneDrive (for example) in sync with the cloud. This script only moves files between
 # a local workspace and a local destination directory, using rsync.
 #
-# Version: 1.2.0
+# Version: 1.2.1
+#
+# New in 1.2.1: four new high-contrast TUI color themes (nord, dracula,
+# solarized, gruvbox), custom Whiptail colors (CUSTOM_NEWT_COLORS) and
+# custom plaintext ANSI colors (CUSTOM_ANSI_COLORS) via config, and
+# enhanced ANSI-styled plaintext TUI fallback menus.
 #
 # New in 1.2.0: config validation, snapshot restore, a sync history log,
 # transfer statistics, JSON status output, include/exclude patterns, and
@@ -22,7 +27,7 @@ set -uo pipefail
 # (diff, rsync in some modes) have meaningful non-zero exit codes that
 # do not mean "script failure", so we check exit codes explicitly instead.
 
-VERSION="rcc-sync v1.2.0"
+VERSION="rcc-sync v1.2.1"
 
 VERBOSE=0
 QUIET=0
@@ -32,11 +37,16 @@ JSON_OUTPUT=0
 # ANSI Colors
 C_RESET='\033[0m'
 C_BOLD='\033[1m'
+C_DIM='\033[2m'
 C_RED='\033[0;31m'
 C_GREEN='\033[0;32m'
 C_YELLOW='\033[0;33m'
 C_BLUE='\033[0;34m'
+C_MAGENTA='\033[0;35m'
 C_CYAN='\033[0;36m'
+
+C_PRIMARY="${C_CYAN}"
+C_ACCENT="${C_BLUE}"
 
 log_error() {
     echo -e "${C_RED}${C_BOLD}Error:${C_RESET} $*" >&2
@@ -60,6 +70,8 @@ ARCHIVE_DIR="${HOME}/.rcc-sync-archives"
 
 # TUI color theme
 TUI_THEME="default"
+CUSTOM_NEWT_COLORS=""
+CUSTOM_ANSI_COLORS=""
 
 # Optional include/exclude support — see build_exclude_args. Empty by
 # default, meaning nothing is excluded unless configured.
@@ -128,6 +140,8 @@ load_config() {
             REMOTE_ROOT)  REMOTE_ROOT="$(expand_path "$value")" ;;
             ARCHIVE_DIR)  ARCHIVE_DIR="$(expand_path "$value")" ;;
             TUI_THEME)    TUI_THEME="$value" ;;
+            CUSTOM_NEWT_COLORS) CUSTOM_NEWT_COLORS="$value" ;;
+            CUSTOM_ANSI_COLORS) CUSTOM_ANSI_COLORS="$value" ;;
             EXCLUDE_FILE) EXCLUDE_FILE="$(expand_path "$value")" ;;
             EXCLUDE_PATTERNS) EXCLUDE_PATTERNS="$value" ;;
             CONFIRM_FILE_THRESHOLD)
@@ -503,6 +517,12 @@ cmd_config() {
     printf 'REMOTE_ROOT  = %s\n' "$(display_path "$REMOTE_ROOT")"
     printf 'ARCHIVE_DIR  = %s\n' "$(display_path "$ARCHIVE_DIR")"
     printf 'TUI_THEME    = %s\n' "$TUI_THEME"
+    if [[ -n "$CUSTOM_NEWT_COLORS" ]]; then
+        printf 'CUSTOM_NEWT_COLORS = %s\n' "$CUSTOM_NEWT_COLORS"
+    fi
+    if [[ -n "$CUSTOM_ANSI_COLORS" ]]; then
+        printf 'CUSTOM_ANSI_COLORS = %s\n' "$CUSTOM_ANSI_COLORS"
+    fi
     if [[ -n "$EXCLUDE_FILE" ]]; then
         printf 'EXCLUDE_FILE = %s\n' "$(display_path "$EXCLUDE_FILE")"
     fi
@@ -599,7 +619,7 @@ cmd_config_validate() {
     fi
 
     case "$TUI_THEME" in
-        default|dark|ocean|matrix) : ;;
+        default|dark|ocean|matrix|nord|dracula|solarized|gruvbox|custom) : ;;
         *)
             log_warn "Unknown TUI_THEME '${TUI_THEME}' — will fall back to 'default'."
             (( warnings++ )) || true
@@ -645,6 +665,12 @@ write_config() {
         echo "REMOTE_ROOT=$(display_path "$REMOTE_ROOT")"
         echo "ARCHIVE_DIR=$(display_path "$ARCHIVE_DIR")"
         echo "TUI_THEME=$TUI_THEME"
+        if [[ -n "$CUSTOM_NEWT_COLORS" ]]; then
+            echo "CUSTOM_NEWT_COLORS=\"$CUSTOM_NEWT_COLORS\""
+        fi
+        if [[ -n "$CUSTOM_ANSI_COLORS" ]]; then
+            echo "CUSTOM_ANSI_COLORS=\"$CUSTOM_ANSI_COLORS\""
+        fi
         echo
         echo "# Optional: rsync-style exclude patterns file (one pattern per line,"
         echo "# like .gitignore). A .rccsyncignore file at the root of LOCAL_ROOT is"
@@ -1511,11 +1537,16 @@ dlg_init_menu() {
 dlg_theme_menu() {
     local choice
     choice="$(dlg_menu "Color Themes" "Select a TUI Theme:" \
-        default "Standard (Blue/Gray)" \
-        dark    "Dark Mode (Black/White)" \
-        ocean   "Deep Ocean (Blue/Cyan)" \
-        matrix  "The Matrix (Black/Green)" \
-        back    "Back to main menu")"
+        default   "Standard (Blue/Gray)" \
+        dark      "Dark Mode (Black/White)" \
+        ocean     "Deep Ocean (Blue/Cyan)" \
+        matrix    "The Matrix (Black/Green)" \
+        nord      "Nord (Slate Gray & Frost)" \
+        dracula   "Dracula (Dark & Purple/Cyan)" \
+        solarized "Solarized Dark (Blue & Cyan)" \
+        gruvbox   "Gruvbox (Warm Amber & Red)" \
+        custom    "Custom Palette (from Config)" \
+        back      "Back to main menu")"
     [[ $? -ne 0 || "$choice" == "back" ]] && return
 
     TUI_THEME="$choice"
@@ -1844,21 +1875,23 @@ run_tui_plain() {
     local choice
     while true; do
         echo
-        echo "RCC Sync — Interactive Mode (${VERSION#rcc-sync })"
+        echo -e "${C_PRIMARY}${C_BOLD}====================================================${C_RESET}"
+        echo -e "${C_PRIMARY}${C_BOLD}    RCC Sync — Interactive Mode (${VERSION#rcc-sync })${C_RESET}"
+        echo -e "${C_PRIMARY}${C_BOLD}====================================================${C_RESET}"
         echo
-        echo "  1) Status"
-        echo "  2) Diff"
-        echo "  3) Push"
-        echo "  4) Pull"
-        echo "  5) Mirror  [DESTRUCTIVE]"
-        echo "  6) Restore from snapshot"
-        echo "  7) Dry Push (preview)"
-        echo "  8) Dry Pull (preview)"
-        echo "  9) History"
-        echo " 10) Config"
-        echo " 11) Validate Config"
-        echo " 12) Init / Setup"
-        echo " 13) Quit"
+        echo -e "  ${C_CYAN}1)${C_RESET} Status"
+        echo -e "  ${C_CYAN}2)${C_RESET} Diff"
+        echo -e "  ${C_CYAN}3)${C_RESET} Push"
+        echo -e "  ${C_CYAN}4)${C_RESET} Pull"
+        echo -e "  ${C_CYAN}5)${C_RESET} Mirror  ${C_RED}${C_BOLD}[DESTRUCTIVE]${C_RESET}"
+        echo -e "  ${C_CYAN}6)${C_RESET} Restore from snapshot"
+        echo -e "  ${C_CYAN}7)${C_RESET} Dry Push (preview)"
+        echo -e "  ${C_CYAN}8)${C_RESET} Dry Pull (preview)"
+        echo -e "  ${C_CYAN}9)${C_RESET} History"
+        echo -e " ${C_CYAN}10)${C_RESET} Config"
+        echo -e " ${C_CYAN}11)${C_RESET} Validate Config"
+        echo -e " ${C_CYAN}12)${C_RESET} Init / Setup"
+        echo -e " ${C_CYAN}13)${C_RESET} Quit"
         echo
 
         if ! read -r -p "Choose an option [1-13]: " choice; then
@@ -1880,7 +1913,7 @@ run_tui_plain() {
            12) cmd_init; plain_pause ;;
            13) break ;;
             "") : ;;
-            *) echo "Invalid option: $choice"; plain_pause ;;
+            *) echo -e "${C_RED}Invalid option: $choice${C_RESET}"; plain_pause ;;
         esac
     done
 }
@@ -1895,10 +1928,16 @@ run_tui() {
 }
 
 apply_theme() {
+    # Apply custom ANSI colors for plaintext fallback if defined
+    if [[ -n "$CUSTOM_ANSI_COLORS" ]]; then
+        eval "$CUSTOM_ANSI_COLORS" 2>/dev/null || true
+    fi
+
     [[ "$DIALOG_BIN" != "whiptail" ]] && return
 
     case "$TUI_THEME" in
         dark)
+            # Pure monochrome: white on black, yellow highlight for selected items
             export NEWT_COLORS='
                 root=white,black
                 window=white,black
@@ -1920,25 +1959,30 @@ apply_theme() {
             '
             ;;
         ocean)
+            # Blue outer frame with black dialog interior for readable text;
+            # cyan interactive highlights
             export NEWT_COLORS='
                 root=white,blue
-                window=white,blue
-                border=white,blue
+                window=white,black
+                border=brightcyan,blue
                 shadow=black,black
                 button=black,cyan
-                actbutton=white,blue
-                title=white,blue
+                actbutton=black,brightcyan
+                title=brightcyan,blue
                 roottext=white,blue
-                listbox=white,blue
+                listbox=white,black
                 actlistbox=black,cyan
-                sellistbox=black,white
-                actsellistbox=black,white
-                checkbox=white,blue
+                sellistbox=black,cyan
+                actsellistbox=black,brightcyan
+                textbox=white,black
+                acttextbox=black,cyan
+                checkbox=white,black
                 actcheckbox=black,cyan
-                entry=black,cyan
+                entry=white,black
             '
             ;;
         matrix)
+            # Terminal green on black, inverted green highlight
             export NEWT_COLORS='
                 root=green,black
                 window=green,black
@@ -1952,10 +1996,111 @@ apply_theme() {
                 actlistbox=black,green
                 sellistbox=black,green
                 actsellistbox=black,green
+                textbox=green,black
+                acttextbox=black,green
                 checkbox=green,black
                 actcheckbox=black,green
                 entry=black,green
             '
+            ;;
+        nord)
+            # Nord Polar Night: lightgray slate base, black-on-cyan frost
+            # accents for all active/selected elements (high contrast)
+            export NEWT_COLORS='
+                root=white,lightgray
+                window=black,lightgray
+                border=cyan,lightgray
+                shadow=black,black
+                button=black,white
+                actbutton=black,cyan
+                title=cyan,lightgray
+                roottext=white,lightgray
+                listbox=black,lightgray
+                actlistbox=black,cyan
+                sellistbox=black,cyan
+                actsellistbox=black,brightcyan
+                textbox=black,lightgray
+                acttextbox=black,cyan
+                checkbox=black,lightgray
+                actcheckbox=black,cyan
+                entry=black,white
+            '
+            ;;
+        dracula)
+            # Dracula: dark base, black-on-magenta/cyan accents for all
+            # active elements; keeps Dracula's signature purple/cyan feel
+            export NEWT_COLORS='
+                root=white,black
+                window=white,black
+                border=magenta,black
+                shadow=black,black
+                button=black,magenta
+                actbutton=black,cyan
+                title=brightmagenta,black
+                roottext=magenta,black
+                listbox=white,black
+                actlistbox=black,magenta
+                sellistbox=black,magenta
+                actsellistbox=black,cyan
+                textbox=white,black
+                acttextbox=black,magenta
+                checkbox=white,black
+                actcheckbox=black,magenta
+                entry=black,magenta
+            '
+            ;;
+        solarized)
+            # Solarized Dark: blue outer frame with black dialog interior;
+            # yellow title/accent, cyan interactive highlights
+            export NEWT_COLORS='
+                root=cyan,blue
+                window=white,black
+                border=yellow,blue
+                shadow=black,black
+                button=black,cyan
+                actbutton=black,yellow
+                title=yellow,blue
+                roottext=cyan,blue
+                listbox=white,black
+                actlistbox=black,cyan
+                sellistbox=black,yellow
+                actsellistbox=black,yellow
+                textbox=white,black
+                acttextbox=black,cyan
+                checkbox=white,black
+                actcheckbox=black,cyan
+                entry=white,black
+            '
+            ;;
+        gruvbox)
+            # Gruvbox Dark: black base with warm yellow/red accents,
+            # yellow interactive elements, red title matches Gruvbox's warm palette
+            export NEWT_COLORS='
+                root=yellow,black
+                window=yellow,black
+                border=brown,black
+                shadow=black,black
+                button=black,brown
+                actbutton=black,yellow
+                title=brightred,black
+                roottext=yellow,black
+                listbox=yellow,black
+                actlistbox=black,yellow
+                sellistbox=black,brown
+                actsellistbox=black,yellow
+                textbox=yellow,black
+                acttextbox=black,yellow
+                checkbox=yellow,black
+                actcheckbox=black,yellow
+                entry=black,yellow
+            '
+            ;;
+        custom)
+            if [[ -n "$CUSTOM_NEWT_COLORS" ]]; then
+                export NEWT_COLORS="$CUSTOM_NEWT_COLORS"
+            else
+                unset NEWT_COLORS
+            fi
             ;;
         *)
             unset NEWT_COLORS
